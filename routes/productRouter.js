@@ -12,7 +12,7 @@ const multer = require('multer');
 const csv = require('csv-parser');
 const fs = require('fs');
 const { refreshToken } = require('firebase-admin/app');
-const upload = multer({ dest: 'uploads/' }); // Carpeta temporal
+const upload = multer({ dest: 'uploads/' });
 
 const adminMiddleware = require("../middleware/adminMiddleware")
 const verifyToken = require("../middleware/authMiddleware")
@@ -40,26 +40,12 @@ productRouter.post("/api/product/create", adminMiddleware, async (req, res) => {
         return res.status(409).json({ message: "Error de tipo: porcentaje_promo debe ser un número. 🔴" });
     }
 
-    if (formData.cuotas_sin_interes && typeof formData.cuotas_sin_interes !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: cuotas_sin_interes debe ser un número. 🔴" });
-    }
-
     if (formData.en_promocion !== undefined && typeof formData.en_promocion !== 'boolean') {
         return res.status(409).json({ message: "Error de tipo: en_promocion debe ser un valor booleano. 🔴" });
     }
 
     if (typeof formData.nombre !== 'string' || typeof formData.sku_padre !== 'string' || typeof formData.marca !== 'string') {
         return res.status(409).json({ message: "Error de tipo: nombre, marca y sku_padre deben ser cadenas de texto. 🔴" });
-    }
-
-    /* if (!Array.isArray(formData.variantes) || formData.variantes.length === 0) {
-        return res.status(400).json({ message: "El producto debe tener al menos una variante definida. 🔴" });
-    } */
-
-    if (formData.cuotas_sin_interes !== undefined) {
-        formData.cuotas_sin_interes = Number(formData.cuotas_sin_interes);
-        console.log(typeof formData.cuotas_sin_interes, formData.cuotas_sin_interes);
-        
     }
 
     try {
@@ -99,15 +85,10 @@ productRouter.get("/api/product/:id", async (req, res) => {
 productRouter.get("/api/products", async (req, res) => {
     try { 
         const products = await Product.find(); 
-
         res.status(200).json({ message: "Products fetched successfully! 🟢", products });
-
     } catch(error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
-        res.status(500).json({ 
-            message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴", 
-            
-        });
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
     }
 });
 
@@ -121,7 +102,6 @@ productRouter.get("/api/products/limit", async (req, res) => {
             Product.find().sort({ createdAt: -1 }).limit(limit).skip(offset), Product.countDocuments()]);
 
         res.status(200).json({ message: "Products fetched successfully! 🟢", products, total });
-
     } catch(error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
         res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
@@ -154,10 +134,6 @@ productRouter.put("/api/product/update/:id", adminMiddleware, async (req, res) =
 
     if (formData.porcentaje_promo && typeof formData.porcentaje_promo !== 'number') {
         return res.status(409).json({ message: "Error de tipo: porcentaje_promo debe ser un número. 🔴" });
-    }
-
-    if (formData.cuotas_sin_interes && typeof formData.cuotas_sin_interes !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: cuotas_sin_interes debe ser un número. 🔴" });
     }
 
     if (formData.en_promocion !== undefined && typeof formData.en_promocion !== 'boolean') {
@@ -230,38 +206,24 @@ productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
         let updateQuery = {};
         let setFields = {};
 
-        if (cambios.estado) {
-            setFields.estado = cambios.estado;
-        }
+        if (cambios.estado)  setFields.estado = cambios.estado;
+        if (cambios.marca)   setFields.marca  = cambios.marca;
 
-        if (cambios.marca) {
-            setFields.marca = cambios.marca;
-        }
-
-        if (typeof cambios.en_promocion !== 'undefined') {
+        if (typeof cambios.en_promocion !== 'undefined')
             setFields.en_promocion = cambios.en_promocion;
-        }
 
-        if (typeof cambios.porcentaje_promo !== 'undefined') {
+        if (typeof cambios.porcentaje_promo !== 'undefined')
             setFields.porcentaje_promo = cambios.porcentaje_promo;
-        }
 
-        if (typeof cambios.cuotas_sin_interes !== 'undefined') {
-            setFields.cuotas_sin_interes = Number(cambios.cuotas_sin_interes);
-        }
-
-        if (Object.keys(setFields).length > 0) {
-            updateQuery.$set = setFields;
-        }
+        if (Object.keys(setFields).length > 0) updateQuery.$set = setFields;
 
         if (cambios.porcentaje_precio) {
             const factor = 1 + (cambios.porcentaje_precio / 100);
             updateQuery.$mul = { precio_base: factor };
         }
 
-        if (typeof cambios.stock_a_sumar === 'number') {
+        if (typeof cambios.stock_a_sumar === 'number')
             updateQuery.$inc = { "variantes.$[].stock": cambios.stock_a_sumar };
-        }
 
         const result = await Product.updateMany(
             { _id: { $in: ids } }, 
@@ -316,7 +278,6 @@ productRouter.delete("/api/bulk-delete", adminMiddleware, async (req, res) => {
     }
     try {
         const result = await Product.deleteMany({ _id: { $in: ids } }); 
-
         res.status(200).json({ message: "Massive delete made successfully! 🟢", detalles: { total_seleccionados: ids.length, total_eliminados: result.deletedCount } });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] 🚨 ERROR en bulk-delete:`, error);
@@ -330,10 +291,9 @@ productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) 
         const productos = await Product.find({}).lean();
         const BOM = '\uFEFF';
         
-        // Headers actualizados con TODOS los campos del Schema
         const headers = [
             "_id", "nombre", "marca", "sku_padre", "estado", "precio_base", 
-            "stock_base", "en_promocion", "porcentaje_promo", "cuotas_sin_interes",
+            "stock_base", "en_promocion", "porcentaje_promo",
             "categorias", "descripcion", "imagenes_generales", 
             "peso", "ancho", "alto", "largo", 
             "variantes"
@@ -343,9 +303,8 @@ productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) 
 
         productos.forEach(p => {
             const categoriasStr = p.categorias ? p.categorias.join(" | ") : "";
-            const imagenesStr = p.imagenes_generales ? p.imagenes_generales.join(" | ") : "";
+            const imagenesStr   = p.imagenes_generales ? p.imagenes_generales.join(" | ") : "";
             
-            // Mantenemos tu formato de variante: sku,talle,color,medida,stock,precio_ad,foto
             const variantesStr = p.variantes ? p.variantes.map(v => 
                 `${v.sku_variante || ''},${v.talle || ''},${v.color || ''},${v.medida || ''},${v.stock || 0},${v.precio_adicional || 0},${v.foto_variante || ''}`
             ).join(" | ") : "";
@@ -357,10 +316,9 @@ productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) 
                 `"${p.sku_padre}"`,
                 p.estado,
                 p.precio_base,
-                p.stock_base || 0, // <--- SUMADO
-                p.en_promocion ? "true" : "false", // <--- SUMADO
-                p.porcentaje_promo || 0, // <--- SUMADO
-                p.cuotas_sin_interes || 0, // <--- SUMADO
+                p.stock_base || 0,
+                p.en_promocion ? "true" : "false",
+                p.porcentaje_promo || 0,
                 `"${categoriasStr}"`,
                 `"${(p.descripcion || "").replace(/;/g, ',').replace(/\n/g, ' ')}"`,
                 `"${imagenesStr}"`,
@@ -406,37 +364,36 @@ productRouter.post("/api/products/bulk-import", upload.single('archivo'), adminM
                                 variantesArray = fila.variantes.split('|').map(vStr => {
                                     const campos = vStr.split(',').map(s => s.trim());
                                     return {
-                                        sku_variante:    campos[0],
-                                        talle:           campos[1] || null,
-                                        color:           campos[2] || null,
-                                        medida:          campos[3] || null,
-                                        gb:              campos[4] || null,   // ← nuevo
-                                        largo_cable:     campos[5] || null,   // ← nuevo
-                                        stock:           Number(campos[6]) || 0,
-                                        precio_adicional:Number(campos[7]) || 0,
-                                        foto_variante:   campos[8] || null
+                                        sku_variante:     campos[0],
+                                        talle:            campos[1] || null,
+                                        color:            campos[2] || null,
+                                        medida:           campos[3] || null,
+                                        gb:               campos[4] || null,
+                                        largo_cable:      campos[5] || null,
+                                        stock:            Number(campos[6]) || 0,
+                                        precio_adicional: Number(campos[7]) || 0,
+                                        foto_variante:    campos[8] || null
                                     };
                                 }).filter(v => v.sku_variante);
                             }
 
                             const datosProducto = {
-                                nombre: fila.nombre?.replace(/"/g, ''),
-                                marca: fila.marca?.replace(/"/g, ''),
-                                sku_padre: fila.sku_padre.trim().replace(/"/g, ''),
-                                precio_base: Number(fila.precio_base) || 0,
-                                stock_base: Number(fila.stock_base) || 0,
-                                en_promocion: fila.en_promocion === 'true',
-                                porcentaje_promo: Number(fila.porcentaje_promo) || 0,
-                                cuotas_sin_interes: Number(fila.cuotas_sin_interes) || 0,
-                                estado: fila.estado || 'activo',
-                                descripcion: fila.descripcion?.replace(/"/g, ''),
-                                categorias: fila.categorias ? fila.categorias.replace(/"/g, '').split('|').map(c => c.trim()) : [],
-                                imagenes_generales: fila.imagenes_generales ? fila.imagenes_generales.replace(/"/g, '').split('|').map(i => i.trim()) : [],
-                                variantes: variantesArray,
+                                nombre:            fila.nombre?.replace(/"/g, ''),
+                                marca:             fila.marca?.replace(/"/g, ''),
+                                sku_padre:         fila.sku_padre.trim().replace(/"/g, ''),
+                                precio_base:       Number(fila.precio_base) || 0,
+                                stock_base:        Number(fila.stock_base) || 0,
+                                en_promocion:      fila.en_promocion === 'true',
+                                porcentaje_promo:  Number(fila.porcentaje_promo) || 0,
+                                estado:            fila.estado || 'activo',
+                                descripcion:       fila.descripcion?.replace(/"/g, ''),
+                                categorias:        fila.categorias ? fila.categorias.replace(/"/g, '').split('|').map(c => c.trim()) : [],
+                                imagenes_generales:fila.imagenes_generales ? fila.imagenes_generales.replace(/"/g, '').split('|').map(i => i.trim()) : [],
+                                variantes:         variantesArray,
                                 medidas_empaque: {
-                                    peso: Number(fila.peso) || 0,
+                                    peso:  Number(fila.peso)  || 0,
                                     ancho: Number(fila.ancho) || 0,
-                                    alto: Number(fila.alto) || 0,
+                                    alto:  Number(fila.alto)  || 0,
                                     largo: Number(fila.largo) || 0
                                 }
                             };
@@ -469,17 +426,12 @@ productRouter.post("/api/products/bulk-import", upload.single('archivo'), adminM
 productRouter.post("/api/categories", adminMiddleware, async (req, res) => {
     try {
         const { nombre } = req.body;
-        
         const nuevaCategoria = new Category({ nombre });
         await nuevaCategoria.save(); 
-        
         res.status(201).json(nuevaCategoria);
     } catch (error) {
-        
         if (error.code === 11000) {
-            return res.status(400).json({ 
-                message: "ERROR_SYSTEM: LA_CATEGORIA_YA_EXISTE_EN_DB" 
-            });
+            return res.status(400).json({ message: "ERROR_SYSTEM: LA_CATEGORIA_YA_EXISTE_EN_DB" });
         }
         console.error(`[${new Date().toISOString()}] ERROR en CREAR CATEGORIA POST`, error);
         res.status(500).json({ message: "ERROR_INTERNAL_SERVER" });
@@ -490,7 +442,6 @@ productRouter.post("/api/categories", adminMiddleware, async (req, res) => {
 productRouter.get("/api/categories", async (req, res) => {
     try {
         const categorias = await Category.find();
-
         res.status(200).json({ message: "Categories found successfully! 🟢", categorias });
     } catch(error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter LEER CATEGORIAS = GET :`, error);
@@ -502,9 +453,7 @@ productRouter.get("/api/categories", async (req, res) => {
 productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) => {
     try {
         await Category.findByIdAndDelete(req.params.id);
-
         const categoriasActualizadas = await Category.find();
-        
         res.status(200).json({ message: "Categoría eliminada", categoriasActualizadas });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR en BORRAR CATEGORIA DELETE`, error);
@@ -512,7 +461,7 @@ productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) =>
     }
 });
 
-//FAVORITOS
+// FAVORITOS
 productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
     const { nombre, userEmail, productId, isFavorite } = req.body;
     console.log("FAVORITO", req.body);
@@ -525,11 +474,9 @@ productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
         if (isFavorite) {
             const newFavorite = new Favorite({ nombre, userEmail, productId });
             await newFavorite.save();
-
             return res.status(201).json({ message: "Agregado a favoritos", active: true });
         } else {
             await Favorite.findOneAndDelete({ nombre, userEmail, productId });
-
             return res.status(200).json({ message: "Eliminado de favoritos", active: false });
         }
     } catch (error) {
@@ -540,7 +487,6 @@ productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
         res.status(500).json({ message: "Error en el servidor", error });
     }
 });
-
 
 productRouter.get('/api/product/fav/:email', verifyToken, async (req, res) => {
     try {
@@ -565,7 +511,7 @@ productRouter.get('/api/products/brands', async (req, res) => {
 
 productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, res) => {
     try {
-        const { limit = 20, offset = 0, nombre, marca, categoria, talle, minPre, maxPre, promo, stock, cuotas } = req.query;
+        const { limit = 20, offset = 0, nombre, marca, categoria, talle, minPre, maxPre, promo, stock } = req.query;
         let query = { estado: 'activo' };
 
         // ── BÚSQUEDA POR STRING ───────────────────────────────────
@@ -610,10 +556,7 @@ productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, r
         // ── FILTROS EXACTOS ───────────────────────────────────────
         if (marca     && marca !== "")     query.marca      = { $regex: new RegExp(`^${marca}$`, 'i') };
         if (categoria && categoria !== "") query.categorias = { $regex: new RegExp(`^${categoria}$`, 'i') };
-
-        if (promo === 'true') query.en_promocion = true;
-
-        if (cuotas && cuotas !== "") query.cuotas_sin_interes = Number(cuotas);
+        if (promo === 'true')              query.en_promocion = true;
 
         if (minPre || maxPre) {
             query.precio_base = {};
@@ -649,7 +592,6 @@ productRouter.post("/api/product/rating", verifyToken, async (req, res) => {
         }
         const review = await Reseñas.create(reviewData)
         res.status(201).json({ message: "Review created successfully! 🟢", review })
-
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR AL CREAR REVIEW DE PRODUCTO`, error);
         res.status(500).json({ error: "INTERNAL_ERROR_PRODUCT REVIEW" });
@@ -666,4 +608,4 @@ productRouter.get("/api/product-reviews", async (req, res) => {
     }
 })
 
-module.exports = productRouter; 
+module.exports = productRouter;

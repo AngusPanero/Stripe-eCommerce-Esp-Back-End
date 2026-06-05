@@ -10,7 +10,7 @@ const productSchema = new mongoose.Schema({
   marca: { 
     type: String, 
     required: [true, 'La marca es obligatoria'], 
-    trim: true ,
+    trim: true,
     set: (v) => v?.toLowerCase()
   },
   stock_base: { 
@@ -36,20 +36,20 @@ const productSchema = new mongoose.Schema({
 
   variantes: [{
     sku_variante: { type: String, required: true, sparse: true, unique: true },
-    talle: { type: String, default: null },
-    color: { type: String, default: null },
-    medida: { type: String, default: null },
-    gb: { type: String, default: null },  
-    largo_cable: { type: String, default: null },
-    stock: { type: Number, default: 0 },
+    talle:        { type: String, default: null },
+    color:        { type: String, default: null },
+    medida:       { type: String, default: null },
+    gb:           { type: String, default: null },  
+    largo_cable:  { type: String, default: null },
+    stock:        { type: Number, default: 0 },
     precio_adicional: { type: Number, default: 0 },
     foto_variante: { type: String, default: null }
   }],
 
   medidas_empaque: {
-    peso: { type: Number, default: 0 },
+    peso:  { type: Number, default: 0 },
     ancho: { type: Number, default: 0 },
-    alto: { type: Number, default: 0 },
+    alto:  { type: Number, default: 0 },
     largo: { type: Number, default: 0 }
   },
 
@@ -70,15 +70,8 @@ const productSchema = new mongoose.Schema({
     min: 0,
     max: 100
   },
-  cuotas_sin_interes: {
-    type: Number,
-    default: 0, 
-    min: 0,
-    enum: [0, 3, 6, 9, 12] 
-  }
-}, { 
-  timestamps: true 
-});
+
+}, { timestamps: true });
 
 productSchema.index({ nombre: 'text', sku_padre: 'text' });
 
