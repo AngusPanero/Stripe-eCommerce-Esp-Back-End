@@ -32,6 +32,28 @@ const PaymentsSchema = new mongoose.Schema({
     invoiceSent:     { type: Boolean, default: false },
     invoiceSentAt:   { type: Date },
     invoiceFilename: { type: String },   
+    shipping: {
+    mode:        { type: String, enum: ["delivery", "pickup"], default: "delivery" },
+    cost:        { type: Number, default: 0 },
+    ownerCovers: { type: Boolean, default: false },
+    address: {
+            calle:        String,
+            numero:       String,
+            piso:         String,
+            ciudad:       String,
+            provincia:    String,
+            codigoPostal: String,
+            pais:         String,
+        }
+    },
+    billing: {
+        type:            { type: String, enum: ["fisica", "empresa"], default: "fisica" },
+        razonSocial:     String,
+        cif:             String,
+        direccionFiscal: String,
+        ciudadFiscal:    String,
+        cpFiscal:        String,
+    },
 
 }, { timestamps: true });
 

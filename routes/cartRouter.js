@@ -354,7 +354,7 @@ cartRouter.post("/api/cart/send-recovery", adminMiddleware, async (req, res) => 
           </td>
           <td style="padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;vertical-align:middle;">
             <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:16px;font-weight:800;color:#F0EBE5;margin:0;">
-              $${Math.round(item.precio * item.cantidad).toLocaleString("es-AR")}
+              $${Math.round(item.precio * item.cantidad).toLocaleString("es")}
             </p>
           </td>
         </tr>
@@ -451,7 +451,7 @@ cartRouter.post("/api/cart/send-recovery", adminMiddleware, async (req, res) => 
                         </td>
                         <td style="padding-top:16px;text-align:right;">
                           <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:22px;font-weight:800;color:#F0EBE5;margin:0;">
-                            $${Math.round(totalBruto).toLocaleString("es-AR")}
+                            $${Math.round(totalBruto).toLocaleString("es")}
                           </p>
                         </td>
                       </tr>
