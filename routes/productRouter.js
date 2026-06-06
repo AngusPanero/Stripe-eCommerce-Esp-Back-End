@@ -463,7 +463,9 @@ productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) =>
 
 // FAVORITOS
 productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
-    const { nombre, userEmail, productId, isFavorite } = req.body;
+    console.log("BODY COMPLETO:", JSON.stringify(req.body, null, 2));
+    const { nombre, userEmail, productId, isFavorite, img } = req.body;
+    console.log("IMG RECIBIDO:", img, typeof img);
     console.log("FAVORITO", req.body);
     
     if (!userEmail || !productId) {
@@ -472,7 +474,7 @@ productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
 
     try {
         if (isFavorite) {
-            const newFavorite = new Favorite({ nombre, userEmail, productId });
+            const newFavorite = new Favorite({ nombre, userEmail, productId, img });
             await newFavorite.save();
             return res.status(201).json({ message: "Agregado a favoritos", active: true });
         } else {

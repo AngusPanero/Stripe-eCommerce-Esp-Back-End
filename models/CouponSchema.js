@@ -18,7 +18,7 @@ const CouponSchema = new mongoose.Schema({
         enum:    ['all', 'products', 'categories'],
         default: 'all'
     },
-    /* allowedProducts:   [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }], */
+
     allowedProducts: [{ type: String }],
     allowedCategories: [{ type: String }],  
 

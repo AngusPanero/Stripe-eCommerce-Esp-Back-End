@@ -50,7 +50,6 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
 });
 
 // TEST REAL PAYMENT
-// TEST STRIPE PAYMENT — reemplaza /test-payment-complete de MP
 paymentsRouter.post("/test-payment-complete", async (req, res) => {
     const {
         payer, idempotencyKey,

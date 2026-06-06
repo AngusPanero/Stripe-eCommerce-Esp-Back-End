@@ -17,7 +17,14 @@ const FavoriteSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Product',
         required: true
+    },
+    img: {
+        type: String,
+        trim: true,
+        default: ""
     }
+
+
 }, { timestamps: true });
 
 // Índice único: Un usuario + Un producto = Solo una entrada en la DB
