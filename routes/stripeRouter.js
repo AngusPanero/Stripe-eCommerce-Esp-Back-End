@@ -388,6 +388,21 @@ function orderSummaryHtml(order) {
     </table>`;
 }
 
+function facturaHtml(o) {
+    const b = o.billing || {};
+    const doc = b.documento || b.cif;
+    if (!doc) return "";
+    const d = b.direccion || {};
+    const dir = [
+        [d.calle, d.numero, d.piso].filter(Boolean).join(" "),
+        [d.codigoPostal, d.ciudad].filter(Boolean).join(" "),
+        d.provincia,
+        d.pais,
+    ].filter(Boolean).join(", ");
+    const tipoDoc = b.tipoDocumento === "vat_ue" ? "NIF-IVA" : (b.tipoDocumento || "NIF").toUpperCase();
+    return p(`Datos de facturación: <strong style="color:#fff;">${escapeHtml(titularFactura(b))}</strong> · ${escapeHtml(tipoDoc)} ${escapeHtml(doc)}${dir ? `<br><span style="font-size:13px;color:rgba(240,235,229,.6);">${escapeHtml(dir)}</span>` : ""}`);
+}
+
 const clienteHtml = (o) => p(`Cliente: <strong style="color:#fff;">${escapeHtml(o.nombre || "-")}</strong> · ${escapeHtml(o.email)} · ${escapeHtml(o.telefono || "-")}`);
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -501,12 +516,12 @@ async function afterPaid(order) {
     await sendMail(
         ADMIN_EMAIL,
         `🟢 Nueva venta ${order.orderId} — ${formatEUR(order.totalCents)}${order.needsReview ? " (REVISAR)" : ""}`,
-        mailLayout("Nueva venta aprobada", `${alertas}${clienteHtml(order)}${orderSummaryHtml(order)}`)
+        mailLayout("Nueva venta aprobada", `${alertas}${clienteHtml(order)}${facturaHtml(order)}${orderSummaryHtml(order)}`)
     );
     await sendMail(
         order.email,
         `Confirmación de tu pedido ${order.orderId}`,
-        mailLayout("¡Gracias por tu compra!", `${p("Hemos recibido tu pago correctamente. Te avisaremos cuando tu pedido esté en camino.")}${orderSummaryHtml(order)}`)
+        mailLayout("¡Gracias por tu compra!", `${p("Hemos recibido tu pago correctamente. Te avisaremos cuando tu pedido esté en camino. La factura se emitirá con estos datos.")}${facturaHtml(order)}${orderSummaryHtml(order)}`)
     );
 }
 
@@ -743,8 +758,83 @@ stripeRouter.post("/stripe-quote", verifyToken, async (req, res) => {
 //  Body: { items:[{productId, varianteId?, cantidad}], couponCode?, shipping:{mode, address},
 //          billing?, nombre?, telefono?, orderId? (para reutilizar el pedido al cambiar el carrito) }
 // ════════════════════════════════════════════════════════════════════════════
-const ADDRESS_FIELDS = ["calle", "numero", "piso", "ciudad", "provincia", "codigoPostal", "pais"];
-const BILLING_FIELDS = ["razonSocial", "cif", "direccionFiscal", "ciudadFiscal", "cpFiscal"];
+const ADDRESS_FIELDS = ["calle", "numero", "piso", "ciudad", "provincia", "codigoPostal", "pais", "paisCodigo"];
+
+/* ── Datos de facturación ────────────────────────────────────────────────────
+   Particular: nombre + apellidos + NIF / NIE / pasaporte
+   Empresa / autónomo: razón social + CIF / NIF / NIF-IVA UE
+   Siempre con dirección fiscal completa.
+──────────────────────────────────────────────────────────────────────────── */
+const DOC_TYPES  = ["nif", "nie", "cif", "vat_ue", "pasaporte"];
+const DNI_LETRAS = "TRWAGMYFPDXBNJZSQVHLCKE";
+
+const normalizarDoc = (v) => String(v || "").toUpperCase().replace(/[\s.\-\/]/g, "");
+const letraDNIok    = (numero, letra) => DNI_LETRAS[Number(numero) % 23] === letra;
+
+function validarCIF(v) {
+    if (!/^[ABCDEFGHJNPQRSUVW]\d{7}[0-9A-J]$/.test(v)) return false;
+    const d = v.slice(1, 8).split("").map(Number);
+    const pares = d[1] + d[3] + d[5];
+    let impares = 0;
+    [d[0], d[2], d[4], d[6]].forEach(n => { const x = n * 2; impares += Math.floor(x / 10) + (x % 10); });
+    const control = (10 - ((pares + impares) % 10)) % 10;
+    return v[8] === String(control) || v[8] === "JABCDEFGHI"[control];
+}
+
+function validarDocumento(tipo, raw) {
+    const v = normalizarDoc(raw);
+    if (!v) return false;
+    switch (tipo) {
+        case "nif":       return (/^\d{8}[A-Z]$/.test(v) && letraDNIok(v.slice(0, 8), v[8])) || validarCIF(v);
+        case "nie":       return /^[XYZ]\d{7}[A-Z]$/.test(v) && letraDNIok("XYZ".indexOf(v[0]) + v.slice(1, 8), v[8]);
+        case "cif":       return validarCIF(v) || (/^\d{8}[A-Z]$/.test(v) && letraDNIok(v.slice(0, 8), v[8]));
+        case "vat_ue":    return /^[A-Z]{2}[A-Z0-9]{2,13}$/.test(v);
+        case "pasaporte": return /^[A-Z0-9]{5,20}$/.test(v);
+        default:          return false;
+    }
+}
+
+function sanitizeAddress(raw = {}) {
+    const out = {};
+    for (const k of ADDRESS_FIELDS) out[k] = cleanStr(raw?.[k], 120);
+    out.paisCodigo = out.paisCodigo.toUpperCase().slice(0, 2);
+    return out;
+}
+
+function sanitizeBilling(raw = {}, shippingAddress = null) {
+    const type          = raw?.type === "empresa" ? "empresa" : "fisica";
+    const nombre        = cleanStr(raw?.nombre, 80);
+    const apellidos     = cleanStr(raw?.apellidos, 120);
+    const razonSocial   = cleanStr(raw?.razonSocial, 150);
+    const tipoDocumento = DOC_TYPES.includes(raw?.tipoDocumento) ? raw.tipoDocumento : (type === "empresa" ? "cif" : "nif");
+    const documento     = normalizarDoc(raw?.documento).slice(0, 20);
+
+    const usarEnvio = raw?.mismaDireccion === true && shippingAddress;
+    const direccion = sanitizeAddress(usarEnvio ? shippingAddress : raw?.direccion);
+
+    let error = null;
+    if (type === "fisica" && (!nombre || !apellidos))      error = "Completá nombre y apellidos para la factura";
+    else if (type === "empresa" && !razonSocial)            error = "Completá la razón social para la factura";
+    else if (!validarDocumento(tipoDocumento, documento))   error = "El documento de facturación (NIF / NIE / CIF) no es válido";
+    else if (!direccion.calle || !direccion.codigoPostal || !direccion.ciudad || !direccion.pais) {
+        error = "Completá la dirección de facturación";
+    }
+
+    return {
+        error,
+        data: {
+            type, nombre, apellidos, razonSocial, tipoDocumento, documento, direccion,
+            // compatibilidad con el panel actual
+            cif:             documento,
+            direccionFiscal: [direccion.calle, direccion.numero, direccion.piso].filter(Boolean).join(" "),
+            ciudadFiscal:    direccion.ciudad,
+            cpFiscal:        direccion.codigoPostal,
+        },
+    };
+}
+
+const titularFactura = (b) =>
+    b?.type === "empresa" ? b.razonSocial : [b?.nombre, b?.apellidos].filter(Boolean).join(" ");
 
 stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res) => {
     const email = req.user?.email?.toLowerCase();
@@ -755,21 +845,22 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
     try {
         const shippingMode = shipping?.mode === "pickup" ? "pickup" : "delivery";
 
-        const address = {};
-        for (const k of ADDRESS_FIELDS) address[k] = cleanStr(shipping?.address?.[k], 120);
-        if (shippingMode === "delivery" && (!address.calle || !address.ciudad || !address.codigoPostal)) {
-            return res.status(400).json({ message: "Completá la dirección de envío (calle, ciudad y código postal) 🔴" });
+        const address = sanitizeAddress(shipping?.address);
+        if (shippingMode === "delivery" && (!address.calle || !address.ciudad || !address.codigoPostal || !address.pais)) {
+            return res.status(400).json({ message: "Completá la dirección de envío (calle, ciudad, código postal y país) 🔴" });
         }
 
-        const billingData = { type: billing?.type === "empresa" ? "empresa" : "fisica" };
-        for (const k of BILLING_FIELDS) billingData[k] = cleanStr(billing?.[k], 150);
+        const { data: billingData, error: billingError } = sanitizeBilling(billing, shippingMode === "delivery" ? address : null);
+        if (billingError) return res.status(400).json({ message: `${billingError} 🔴`, code: "BILLING" });
+
+        const contacto = [billingData.nombre, billingData.apellidos].filter(Boolean).join(" ");
 
         const quote = await buildQuote({ items: cartItemsToQuoteItems(items), couponCode, email, shippingMode });
 
         const orderData = {
             client_id: req.user?.uid || email,
             email,
-            nombre:   cleanStr(nombre, 120),
+            nombre:   contacto || titularFactura(billingData) || cleanStr(nombre, 120),
             telefono: cleanStr(telefono, 40) || "N/A",
             items: quote.lines.map(l => ({
                 ...l,

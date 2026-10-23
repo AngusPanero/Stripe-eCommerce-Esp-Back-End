@@ -148,11 +148,29 @@ const PaymentsSchema = new mongoose.Schema({
             provincia:    String,
             codigoPostal: String,
             pais:         String,
+            paisCodigo:   String,   // ISO 3166-1 alpha-2 (ES, PT, FR...)
         }
     },
+
+    // ── Datos de la factura que recibe el cliente ──
     billing: {
-        type:            { type: String, enum: ["fisica", "empresa"], default: "fisica" },
-        razonSocial:     String,
+        type:          { type: String, enum: ["fisica", "empresa"], default: "fisica" },
+        nombre:        String,      // particular, o persona de contacto en empresa
+        apellidos:     String,
+        razonSocial:   String,
+        tipoDocumento: { type: String, enum: ["nif", "nie", "cif", "vat_ue", "pasaporte", null], default: null },
+        documento:     String,      // normalizado: mayúsculas, sin espacios ni guiones
+        direccion: {
+            calle:        String,
+            numero:       String,
+            piso:         String,
+            ciudad:       String,
+            provincia:    String,
+            codigoPostal: String,
+            pais:         String,
+            paisCodigo:   String,
+        },
+        // compatibilidad con el panel / pedidos anteriores
         cif:             String,
         direccionFiscal: String,
         ciudadFiscal:    String,

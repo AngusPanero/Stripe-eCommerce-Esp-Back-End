@@ -17,7 +17,6 @@ const CartSchema = new mongoose.Schema({
             imagen:             String,
             cantidad:           { type: Number, min: 1 },
             stockMax:           Number,
-            cuotas_sin_interes: { type: Number, default: 0 },
             categorias:         [String],
             skuPadre:           { type: String, default: "" },
             varianteLabel:      { type: String, default: "" },
