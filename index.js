@@ -22,6 +22,7 @@ const PORT = process.env.PORT
 
 app.set('trust proxy', 1); // Para el Rate Limiter
 app.use(urlencoded({ extended: true }))
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), stripeRouter.webhookHandler);
 app.use(express.json())
 app.use(cookieParser())
 

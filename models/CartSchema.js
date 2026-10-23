@@ -9,22 +9,23 @@ const CartSchema = new mongoose.Schema({
     },
     items: [
         {
-            id:                 { type: String, required: true },
+            id:                 { type: String, required: true },   // id de variante, o el del producto si es único
             productId:          { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+            varianteId:         { type: String, default: null },
             nombre:             String,
-            precio:             Number,
+            precio:             Number,    // solo visual: el cobro se recalcula siempre en el backend
             imagen:             String,
             cantidad:           { type: Number, min: 1 },
             stockMax:           Number,
             cuotas_sin_interes: { type: Number, default: 0 },
             categorias:         [String],
             skuPadre:           { type: String, default: "" },
-            talle:              { type: String, default: "" },  // ← agregado
-            color:              { type: String, default: "" },  // ← agregado
+            varianteLabel:      { type: String, default: "" },
+            talle:              { type: String, default: "" },  // legado
+            color:              { type: String, default: "" },  // legado
         }
     ],
 
-    // ← definido explícitamente para que no se pierda en .lean() ni populate
     appliedCoupon: {
         code:        { type: String,  default: null },
         discount:    { type: Number,  default: null },
@@ -40,16 +41,14 @@ const CartSchema = new mongoose.Schema({
 
 CartSchema.post('init', function(doc) {
     if (doc.appliedCoupon && doc.appliedCoupon.appliedAt) {
-        const limitTime   = 72 * 60 * 60 * 1000;
+        const limitTime    = 72 * 60 * 60 * 1000;
         const transcurrido = Date.now() - new Date(doc.appliedCoupon.appliedAt).getTime();
 
         if (transcurrido > limitTime) {
-            console.log(">>> ¡EXPIRADO! Borrando cupón de la DB...");
             doc.appliedCoupon = undefined;
             mongoose.model("Cart")
                 .updateOne({ _id: doc._id }, { $unset: { appliedCoupon: "" } })
-                .then(()  => console.log(">>> Cupón expirado removido"))
-                .catch(err => console.error("Error removiendo cupón:", err));
+                .catch(err => console.error("Error removiendo cupón expirado del carrito:", err));
         }
     }
 });

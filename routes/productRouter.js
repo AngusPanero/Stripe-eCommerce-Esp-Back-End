@@ -1,244 +1,442 @@
 const express = require('express');
 const productRouter = express.Router();
-const Product = require('../models/productModel');
-const Category = require("../models/CategorySchema")
-const Favorite = require("../models/FavoriteSchema")
-const Reseñas = require("../models/ReseñasSchema")
-const Coupon = require("../models/CouponSchema")
-const mongoose = require('mongoose');   
+const Product   = require('../models/productModel');
+const Category  = require("../models/CategorySchema");
+const Attribute = require("../models/AttributeSchema");
+const Favorite  = require("../models/FavoriteSchema");
+const Reseñas   = require("../models/ReseñasSchema");
+const mongoose  = require('mongoose');
 
-// CSV EXCEL
+// CSV
 const multer = require('multer');
-const csv = require('csv-parser');
-const fs = require('fs');
-const { refreshToken } = require('firebase-admin/app');
-const upload = multer({ dest: 'uploads/' });
+const csv    = require('csv-parser');
+const fs     = require('fs');
+const upload = multer({ dest: 'uploads/', limits: { fileSize: 10 * 1024 * 1024 } });
 
-const adminMiddleware = require("../middleware/adminMiddleware")
-const verifyToken = require("../middleware/authMiddleware")
+const adminMiddleware = require("../middleware/adminMiddleware");
+const verifyToken     = require("../middleware/authMiddleware");
 
 const esProduccion = (process.env.NODE_ENV === 'production');
 
+/* ════════════════════════════════════════════════════════════════════════════
+   NORMALIZACIÓN DE PRODUCTO
+   Un solo lugar que valida y limpia lo que llega del admin (o del CSV).
+════════════════════════════════════════════════════════════════════════════ */
+const MAX_IMAGES    = 10;
+const MAX_FAQS      = 20;
+const MAX_OPCIONES  = 3;
+const MAX_VARIANTES = 100;
+
+const cleanStr = (v, max = 200) => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, max) : "");
+const toNum = (v) => {
+    if (typeof v === "number") return v;
+    if (typeof v === "string" && v.trim() !== "") return Number(v.trim().replace(",", "."));
+    return NaN;
+};
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const isHttps = (u) => typeof u === "string" && /^https:\/\//i.test(u.trim());
+
+function sanitizeProductPayload(raw = {}) {
+    const errors = [];
+
+    const nombre      = cleanStr(raw.nombre, 150);
+    const marca       = cleanStr(raw.marca, 80);
+    const sku_padre   = cleanStr(raw.sku_padre, 60);
+    const descripcion = typeof raw.descripcion === "string" ? raw.descripcion.trim().slice(0, 5000) : "";
+
+    if (!nombre)    errors.push("El nombre es obligatorio");
+    if (!marca)     errors.push("La marca es obligatoria");
+    if (!sku_padre) errors.push("El SKU padre es obligatorio");
+
+    const precio_base = toNum(raw.precio_base);
+    if (!Number.isFinite(precio_base) || precio_base <= 0) errors.push("El precio base debe ser mayor a 0");
+
+    const imagenes_generales = (Array.isArray(raw.imagenes_generales) ? raw.imagenes_generales : [])
+        .filter(isHttps).map(u => u.trim()).slice(0, MAX_IMAGES);
+    if (!imagenes_generales.length) errors.push("Debés subir al menos una imagen del producto");
+
+    const categorias = [...new Set((Array.isArray(raw.categorias) ? raw.categorias : [])
+        .map(c => cleanStr(c, 50).toLowerCase()).filter(Boolean))];
+
+    const en_promocion = raw.en_promocion === true || raw.en_promocion === "true";
+    const porcentaje_promo = en_promocion ? toNum(raw.porcentaje_promo) : 0;
+    if (en_promocion && (!Number.isFinite(porcentaje_promo) || porcentaje_promo < 1 || porcentaje_promo > 99)) {
+        errors.push("El porcentaje de promoción debe estar entre 1 y 99");
+    }
+
+    const estado = ["activo", "pausado"].includes(raw.estado) ? raw.estado : "activo";
+
+    const m = raw.medidas_empaque || {};
+    const medidas_empaque = {};
+    for (const k of ["peso", "ancho", "alto", "largo"]) {
+        const n = toNum(m[k]);
+        medidas_empaque[k] = Number.isFinite(n) && n >= 0 ? n : 0;
+    }
+
+    // ── FAQs ──
+    const faqs = (Array.isArray(raw.faqs) ? raw.faqs : [])
+        .map(f => ({
+            pregunta:  cleanStr(f?.pregunta, 200),
+            respuesta: typeof f?.respuesta === "string" ? f.respuesta.trim().slice(0, 1500) : "",
+        }))
+        .filter(f => f.pregunta && f.respuesta);
+    if (faqs.length > MAX_FAQS) errors.push(`Máximo ${MAX_FAQS} preguntas frecuentes`);
+
+    // ── VARIANTES ──
+    const rawVars = Array.isArray(raw.variantes) ? raw.variantes : [];
+    const variantes = [];
+    let opciones   = [];
+    let stock_base = 0;
+
+    if (rawVars.length === 0) {
+        stock_base = toNum(raw.stock_base);
+        if (!Number.isInteger(stock_base) || stock_base < 0) {
+            errors.push("El stock debe ser un número entero mayor o igual a 0");
+            stock_base = 0;
+        }
+    } else {
+        if (rawVars.length < 2)            errors.push("Un producto con variantes necesita al menos 2. Si es único, no cargues variantes.");
+        if (rawVars.length > MAX_VARIANTES) errors.push(`Máximo ${MAX_VARIANTES} variantes por producto`);
+
+        const skus = new Set();
+        const combos = new Set();
+        const valoresPorOpcion = new Map();
+        let ref = null;
+
+        rawVars.forEach((v, i) => {
+            const n   = i + 1;
+            const sku = cleanStr(v?.sku_variante, 60);
+
+            if (!sku) errors.push(`Variante ${n}: falta el SKU`);
+            else if (sku.toUpperCase() === sku_padre.toUpperCase()) errors.push(`Variante ${n}: el SKU no puede ser igual al SKU padre`);
+            else if (skus.has(sku.toUpperCase())) errors.push(`SKU de variante repetido: ${sku}`);
+            skus.add(sku.toUpperCase());
+
+            const atributos = (Array.isArray(v?.atributos) ? v.atributos : [])
+                .map(a => ({ nombre: cleanStr(a?.nombre, 40).toLowerCase(), valor: cleanStr(a?.valor, 60) }))
+                .filter(a => a.nombre && a.valor);
+            const nombres = atributos.map(a => a.nombre);
+
+            if (!atributos.length) errors.push(`Variante ${n}: necesita al menos una característica (ej. color)`);
+            if (atributos.length > MAX_OPCIONES) errors.push(`Variante ${n}: máximo ${MAX_OPCIONES} características`);
+            if (new Set(nombres).size !== nombres.length) errors.push(`Variante ${n}: tiene una característica repetida`);
+
+            const firma = [...nombres].sort().join("|");
+            if (ref === null) ref = { firma, orden: nombres };
+            else if (firma !== ref.firma) {
+                errors.push(`Variante ${n}: todas las variantes deben tener las mismas características (${ref.orden.join(", ")})`);
+            }
+
+            const combo = [...atributos].sort((a, b) => a.nombre.localeCompare(b.nombre))
+                .map(a => `${a.nombre}=${a.valor.toLowerCase()}`).join("|");
+            if (atributos.length && combos.has(combo)) errors.push(`Variante ${n}: esa combinación ya existe`);
+            combos.add(combo);
+
+            atributos.forEach(a => {
+                if (!valoresPorOpcion.has(a.nombre)) valoresPorOpcion.set(a.nombre, []);
+                const arr = valoresPorOpcion.get(a.nombre);
+                if (!arr.some(x => x.toLowerCase() === a.valor.toLowerCase())) arr.push(a.valor);
+            });
+
+            const stock = toNum(v?.stock);
+            if (!Number.isInteger(stock) || stock < 0) errors.push(`Variante ${n}: el stock debe ser un entero ≥ 0`);
+
+            const extra = toNum(v?.precio_adicional ?? 0);
+            if (!Number.isFinite(extra) || extra < 0) errors.push(`Variante ${n}: el precio extra no puede ser negativo`);
+
+            const out = {
+                sku_variante:     sku,
+                atributos,
+                stock:            Number.isInteger(stock) && stock >= 0 ? stock : 0,
+                precio_adicional: Number.isFinite(extra) && extra >= 0 ? Math.round(extra * 100) / 100 : 0,
+                foto_variante:    isHttps(v?.foto_variante) ? v.foto_variante.trim() : null,
+                activo:           v?.activo !== false,
+            };
+            if (v?._id && mongoose.Types.ObjectId.isValid(v._id)) out._id = v._id;   // conserva el id (carritos/favoritos)
+            variantes.push(out);
+        });
+
+        if (ref) {
+            // mismo orden de características en todas las variantes
+            variantes.forEach(v => v.atributos.sort((a, b) => ref.orden.indexOf(a.nombre) - ref.orden.indexOf(b.nombre)));
+            opciones = ref.orden.map(nombre => ({ nombre, valores: valoresPorOpcion.get(nombre) || [] }));
+        }
+    }
+
+    return {
+        errors,
+        data: {
+            nombre, marca, sku_padre, descripcion,
+            precio_base: Number.isFinite(precio_base) ? Math.round(precio_base * 100) / 100 : 0,
+            stock_base,
+            imagenes_generales, categorias,
+            en_promocion, porcentaje_promo: en_promocion && Number.isFinite(porcentaje_promo) ? porcentaje_promo : 0,
+            estado, medidas_empaque,
+            opciones, variantes, faqs,
+        },
+    };
+}
+
+function mongooseErrorResponse(res, error, fallback) {
+    if (error.code === 11000) {
+        return res.status(409).json({ message: "El SKU padre o uno de los SKU de variante ya existe en otro producto 🔴" });
+    }
+    if (error.name === "ValidationError") {
+        const first = Object.values(error.errors)[0]?.message;
+        return res.status(400).json({ message: `${first || "Datos inválidos"} 🔴` });
+    }
+    return res.status(500).json({ message: fallback });
+}
+
+const registrarAtributos = (opciones) =>
+    Attribute.registrar(opciones).catch(err => console.error("[ATRIBUTOS] No se pudieron registrar:", err.message));
+
+/* ════════════════════════════════════════════════════════════════════════════
+   CRUD
+════════════════════════════════════════════════════════════════════════════ */
+
 // CREATE INDIVIDUAL
 productRouter.post("/api/product/create", adminMiddleware, async (req, res) => {
-    const { formData } = req.body;
-    console.log("FORM DATA", formData);
-
-    if (!formData.nombre || !formData.sku_padre || !formData.marca || !formData.precio_base || !formData.stock_base) {
-        return res.status(400).json({ message: "Faltan campos obligatorios! 🔴" });
-    }
-
-    if (!Array.isArray(formData.imagenes_generales) || formData.imagenes_generales.length === 0) {
-        return res.status(400).json({ message: "Debes subir al menos una imagen general del producto! 🔴" });
-    }
-
-    if (typeof formData.precio_base !== 'number' || typeof formData.stock_base !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: precio_base y stock_base deben ser números. 🔴" });
-    }
-
-    if (formData.porcentaje_promo && typeof formData.porcentaje_promo !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: porcentaje_promo debe ser un número. 🔴" });
-    }
-
-    if (formData.en_promocion !== undefined && typeof formData.en_promocion !== 'boolean') {
-        return res.status(409).json({ message: "Error de tipo: en_promocion debe ser un valor booleano. 🔴" });
-    }
-
-    if (typeof formData.nombre !== 'string' || typeof formData.sku_padre !== 'string' || typeof formData.marca !== 'string') {
-        return res.status(409).json({ message: "Error de tipo: nombre, marca y sku_padre deben ser cadenas de texto. 🔴" });
-    }
+    const { data, errors } = sanitizeProductPayload(req.body?.formData);
+    if (errors.length) return res.status(400).json({ message: `${errors[0]} 🔴`, errors });
 
     try {
-        const newProduct = await Product.create(formData);
-        res.status(201).json({ message: "Product created successfully! 🟢", product: newProduct });
-
+        const newProduct = await Product.create(data);
+        registrarAtributos(data.opciones);
+        res.status(201).json({ message: "Producto creado con éxito 🟢", product: newProduct });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = POST /create:`, error);
+        mongooseErrorResponse(res, error, "INTERNAL_SERVER_ERROR_CREATING_PRODUCT 🔴");
+    }
+});
 
-        if (error.code === 11000) {
-            return res.status(409).json({ status: 'error', message: 'El SKU_PADRE o uno de los SKU_VARIANTE ya existe en la base de datos.'});
-        }
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_CREATING_PRODUCT 🔴" });
+// ATRIBUTOS EXISTENTES (autocompletado del admin)
+productRouter.get("/api/attributes", adminMiddleware, async (req, res) => {
+    try {
+        const atributos = await Attribute.find().sort({ usos: -1, nombre: 1 }).lean();
+        res.status(200).json({ atributos: atributos.map(a => ({ nombre: a.nombre, valores: a.valores })) });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR GET ATRIBUTOS:`, error);
+        res.status(500).json({ message: "Error al obtener atributos 🔴" });
+    }
+});
+
+// READ ALL
+productRouter.get("/api/products", async (req, res) => {
+    try {
+        const products = await Product.find();
+        res.status(200).json({ message: "Products fetched successfully! 🟢", products });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
+    }
+});
+
+// GET EXPORT CSV  (va antes de /api/product/:id para que no lo capture)
+// Formato de la columna variantes:  SKU ~ stock ~ extra ~ color: Azul / capacidad: 128GB  |  SKU2 ~ ...
+productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) => {
+    try {
+        const productos = await Product.find({}).lean();
+        const BOM  = '\uFEFF';
+        const cell = (v) => `"${String(v ?? "").replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
+
+        const headers = [
+            "_id", "nombre", "marca", "sku_padre", "estado", "precio_base",
+            "stock_base", "en_promocion", "porcentaje_promo",
+            "categorias", "descripcion", "imagenes_generales",
+            "peso", "ancho", "alto", "largo",
+            "variantes"
+        ];
+
+        let csvContent = headers.join(";") + "\n";
+
+        productos.forEach(p => {
+            const variantesStr = (p.variantes || []).map(v => [
+                v.sku_variante || "",
+                v.stock || 0,
+                v.precio_adicional || 0,
+                (v.atributos || []).map(a => `${a.nombre}: ${a.valor}`).join(" / "),
+            ].join(" ~ ")).join(" | ");
+
+            const row = [
+                p._id,
+                cell(p.nombre),
+                cell(p.marca),
+                cell(p.sku_padre),
+                p.estado,
+                p.precio_base,
+                p.stock_base || 0,
+                p.en_promocion ? "true" : "false",
+                p.porcentaje_promo || 0,
+                cell((p.categorias || []).join(" | ")),
+                cell(p.descripcion || ""),
+                cell((p.imagenes_generales || []).join(" | ")),
+                p.medidas_empaque?.peso  || 0,
+                p.medidas_empaque?.ancho || 0,
+                p.medidas_empaque?.alto  || 0,
+                p.medidas_empaque?.largo || 0,
+                cell(variantesStr),
+            ];
+            csvContent += row.join(";") + "\n";
+        });
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename=productos_db.csv');
+        return res.status(200).send(BOM + csvContent);
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR en EXPORT CSV = GET`, error);
+        res.status(500).json({ message: "Error al exportar" });
     }
 });
 
 // READ INDIVIDUAL
 productRouter.get("/api/product/:id", async (req, res) => {
     const { id } = req.params;
-
     if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
     try {
         const product = await Product.findById(id);
-        if (!product) {
-            return res.status(404).json({ message: "Product not found! 🔴" });
-        }
+        if (!product) return res.status(404).json({ message: "Product not found! 🔴" });
         res.status(200).json({ message: "Product found successfully! 🟢", product });
-    } catch(error) {
+    } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET /:id:`, error);
         res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCT! 🔴" });
     }
-})
-
-// READ ALL
-productRouter.get("/api/products", async (req, res) => {
-    try { 
-        const products = await Product.find(); 
-        res.status(200).json({ message: "Products fetched successfully! 🟢", products });
-    } catch(error) {
-        console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
-    }
 });
 
-// READ ALL LIMIT/OFF-SET
-productRouter.get("/api/products/limit", async (req, res) => {
-    try {
-        const limit = Number(req.query.limit) || 20;
-        const offset = Number(req.query.offset) || 0;
-
-        const [products, total] = await Promise.all([
-            Product.find().sort({ createdAt: -1 }).limit(limit).skip(offset), Product.countDocuments()]);
-
-        res.status(200).json({ message: "Products fetched successfully! 🟢", products, total });
-    } catch(error) {
-        console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
-    }
-});
-
-// UPDATE INDIVIDUAL
+// UPDATE INDIVIDUAL — usa save() para que corran las validaciones del modelo
 productRouter.put("/api/product/update/:id", adminMiddleware, async (req, res) => {
-    const { id } = req.params
-    const { formData } = req.body
-
-    console.log("FORMDATA", formData);
-
+    const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
 
-    const { nombre, sku_padre, marca, precio_base, stock_base } = formData;
-    if (!nombre || !sku_padre || !marca || precio_base === undefined || stock_base === undefined) {
-        return res.status(400).json({ message: "Faltan campos obligatorios (nombre, sku, marca, precio o stock)! 🔴" });
-    }
-
-    if (!Array.isArray(formData.imagenes_generales) || formData.imagenes_generales.length === 0) {
-        return res.status(400).json({ message: "Debes subir al menos una imagen general del producto! 🔴" });
-    }
-
-    if (typeof formData.precio_base !== 'number' || typeof formData.stock_base !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: precio_base y stock_base deben ser números. 🔴" });
-    }
-
-    if (formData.porcentaje_promo && typeof formData.porcentaje_promo !== 'number') {
-        return res.status(409).json({ message: "Error de tipo: porcentaje_promo debe ser un número. 🔴" });
-    }
-
-    if (formData.en_promocion !== undefined && typeof formData.en_promocion !== 'boolean') {
-        return res.status(409).json({ message: "Error de tipo: en_promocion debe ser un valor booleano. 🔴" });
-    }
-
-    if (typeof formData.nombre !== 'string' || typeof formData.sku_padre !== 'string' || typeof formData.marca !== 'string') {
-        return res.status(409).json({ message: "Error de tipo: nombre, marca y sku_padre deben ser cadenas de texto. 🔴" });
-    }
+    const { data, errors } = sanitizeProductPayload(req.body?.formData);
+    if (errors.length) return res.status(400).json({ message: `${errors[0]} 🔴`, errors });
 
     try {
-        const updatedProduct = await Product.findByIdAndUpdate(id, { $set: formData }, { new: true, runValidators: true, context: 'query' });
-        if (!updatedProduct) {
-            return res.status(404).json({ message: "Product not found! 🔴" });
-        }
-        res.status(200).json({ message: "Product updated successfully! 🟢", product: updatedProduct });
+        const product = await Product.findById(id);
+        if (!product) return res.status(404).json({ message: "Product not found! 🔴" });
 
+        product.set(data);
+        await product.save();
+        registrarAtributos(data.opciones);
+
+        res.status(200).json({ message: "Producto actualizado con éxito 🟢", product });
     } catch (error) {
-        if (error.code === 11000) {
-            return res.status(409).json({ status: 'error', message: "Error: El SKU que intentas asignar ya está siendo usado por otro producto. 🔴" });
-        }
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = PUT /:id:`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_UPDATING_PRODUCT! 🔴" });
-    }
-})
-
-// UPDATE VARIANT
-productRouter.patch("/api/product/update-variant/:variantId", adminMiddleware, async (req, res) => {
-    try {
-        const { variantId } = req.params;
-        const { formData } = req.body; 
-
-        const updateQuery = {};
-        for (const llave in formData) {
-            updateQuery[`variantes.$.${llave}`] = formData[llave];
-        }
-
-        const productoActualizado = await Product.findOneAndUpdate(
-            { "variantes._id": variantId },
-            { $set: updateQuery },
-            { new: true, runValidators: true } 
-        );
-
-        if (!productoActualizado) {
-            return res.status(404).json({ message: "No se encontró la variante con ese ID ❌" });
-        }
-
-        res.status(200).json({ 
-            message: "Variante actualizada con éxito ✅", 
-            product: productoActualizado 
-        });
-
-    } catch (error) {
-        console.error(`[${new Date().toISOString()}] ERROR en productRouter = PATCH VARIANT /:id:`, error);
-        res.status(500).json({ message: "Error interno" });
+        mongooseErrorResponse(res, error, "INTERNAL_SERVER_ERROR_UPDATING_PRODUCT! 🔴");
     }
 });
 
-// MASSIVE UPDATE
+// UPDATE VARIANT — solo campos permitidos (las características se editan desde el producto completo)
+productRouter.patch("/api/product/update-variant/:variantId", adminMiddleware, async (req, res) => {
+    const { variantId } = req.params;
+    const { formData = {} } = req.body;
+    if (!mongoose.Types.ObjectId.isValid(variantId)) return res.status(400).json({ message: "ID de variante inválido 🔴" });
+
+    const set = {};
+    if (formData.stock !== undefined) {
+        const n = toNum(formData.stock);
+        if (!Number.isInteger(n) || n < 0) return res.status(400).json({ message: "El stock debe ser un entero ≥ 0 🔴" });
+        set["variantes.$.stock"] = n;
+    }
+    if (formData.precio_adicional !== undefined) {
+        const n = toNum(formData.precio_adicional);
+        if (!Number.isFinite(n) || n < 0) return res.status(400).json({ message: "El precio extra no puede ser negativo 🔴" });
+        set["variantes.$.precio_adicional"] = Math.round(n * 100) / 100;
+    }
+    if (formData.sku_variante !== undefined) {
+        const sku = cleanStr(formData.sku_variante, 60);
+        if (!sku) return res.status(400).json({ message: "El SKU no puede quedar vacío 🔴" });
+        set["variantes.$.sku_variante"] = sku;
+    }
+    if (formData.activo !== undefined)        set["variantes.$.activo"] = formData.activo === true;
+    if (formData.foto_variante !== undefined) set["variantes.$.foto_variante"] = isHttps(formData.foto_variante) ? formData.foto_variante.trim() : null;
+
+    if (!Object.keys(set).length) return res.status(400).json({ message: "No hay cambios válidos 🔴" });
+
+    try {
+        const productoActualizado = await Product.findOneAndUpdate(
+            { "variantes._id": variantId },
+            { $set: set },
+            { new: true, runValidators: true }
+        );
+        if (!productoActualizado) return res.status(404).json({ message: "No se encontró la variante con ese ID ❌" });
+
+        res.status(200).json({ message: "Variante actualizada con éxito ✅", product: productoActualizado });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR en productRouter = PATCH VARIANT:`, error);
+        mongooseErrorResponse(res, error, "Error interno");
+    }
+});
+
+// MASSIVE UPDATE — pipeline para que el stock nunca quede negativo y el precio redondee a céntimos
 productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
-    const { ids, cambios } = req.body;
+    const { ids, cambios = {} } = req.body;
 
     if (!Array.isArray(ids) || ids.length === 0) {
-        return res.status(400).json({ 
-            message: "Debes seleccionar al menos un producto para actualizar. 🔴" 
+        return res.status(400).json({ message: "Debes seleccionar al menos un producto para actualizar. 🔴" });
+    }
+    const validIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+
+    const setFields = {};
+    if (["activo", "pausado", "borrado"].includes(cambios.estado)) setFields.estado = cambios.estado;
+    if (typeof cambios.marca === "string" && cambios.marca.trim()) setFields.marca = cambios.marca.trim().toLowerCase();
+    if (typeof cambios.en_promocion === "boolean") setFields.en_promocion = cambios.en_promocion;
+    if (cambios.porcentaje_promo !== undefined) {
+        const n = toNum(cambios.porcentaje_promo);
+        if (!Number.isFinite(n) || n < 0 || n > 99) return res.status(400).json({ message: "El porcentaje de promo debe estar entre 0 y 99 🔴" });
+        setFields.porcentaje_promo = n;
+    }
+    if (setFields.en_promocion === true && !(setFields.porcentaje_promo > 0)) {
+        return res.status(400).json({ message: "Indicá un porcentaje de promoción mayor a 0 🔴" });
+    }
+
+    const pipeline = [];
+    if (Object.keys(setFields).length) {
+        const literal = {};
+        for (const [k, v] of Object.entries(setFields)) literal[k] = { $literal: v };
+        pipeline.push({ $set: literal });
+    }
+
+    const pct = toNum(cambios.porcentaje_precio);
+    if (Number.isFinite(pct) && pct !== 0) {
+        if (pct <= -100) return res.status(400).json({ message: "El ajuste de precio no puede ser de -100% o menos 🔴" });
+        pipeline.push({ $set: { precio_base: { $round: [{ $multiply: ["$precio_base", 1 + pct / 100] }, 2] } } });
+    }
+
+    const delta = toNum(cambios.stock_a_sumar);
+    if (Number.isInteger(delta) && delta !== 0) {
+        pipeline.push({
+            $set: {
+                stock_base: {
+                    $cond: [
+                        { $gt: [{ $size: { $ifNull: ["$variantes", []] } }, 0] },
+                        0,
+                        { $max: [0, { $add: [{ $ifNull: ["$stock_base", 0] }, delta] }] }
+                    ]
+                },
+                variantes: {
+                    $map: {
+                        input: { $ifNull: ["$variantes", []] },
+                        as: "v",
+                        in: { $mergeObjects: ["$$v", { stock: { $max: [0, { $add: [{ $ifNull: ["$$v.stock", 0] }, delta] }] } }] }
+                    }
+                }
+            }
         });
     }
 
+    if (!pipeline.length) return res.status(400).json({ message: "No hay cambios para aplicar 🔴" });
+
     try {
-        let updateQuery = {};
-        let setFields = {};
-
-        if (cambios.estado)  setFields.estado = cambios.estado;
-        if (cambios.marca)   setFields.marca  = cambios.marca;
-
-        if (typeof cambios.en_promocion !== 'undefined')
-            setFields.en_promocion = cambios.en_promocion;
-
-        if (typeof cambios.porcentaje_promo !== 'undefined')
-            setFields.porcentaje_promo = cambios.porcentaje_promo;
-
-        if (Object.keys(setFields).length > 0) updateQuery.$set = setFields;
-
-        if (cambios.porcentaje_precio) {
-            const factor = 1 + (cambios.porcentaje_precio / 100);
-            updateQuery.$mul = { precio_base: factor };
-        }
-
-        if (typeof cambios.stock_a_sumar === 'number')
-            updateQuery.$inc = { "variantes.$[].stock": cambios.stock_a_sumar };
-
-        const result = await Product.updateMany(
-            { _id: { $in: ids } }, 
-            updateQuery, 
-            { runValidators: true }
-        );
-
-        res.status(200).json({ 
-            message: "Actualización masiva completada con éxito! 🟢", 
-            detalles: { 
-                total_seleccionados: ids.length, 
-                total_modificados: result.modifiedCount 
-            }
+        const result = await Product.updateMany({ _id: { $in: validIds } }, pipeline);
+        res.status(200).json({
+            message: "Actualización masiva completada con éxito! 🟢",
+            detalles: { total_seleccionados: ids.length, total_modificados: result.modifiedCount }
         });
-
     } catch (error) {
         console.error(`[${new Date().toISOString()}] 🚨 ERROR en bulk-update:`, error);
         res.status(500).json({ message: "INTERNAL_SERVER_ERROR_IN_BULK_UPDATE! 🔴" });
@@ -247,187 +445,140 @@ productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
 
 // DELETE INDIVIDUAL
 productRouter.delete("/api/product/delete/:id", adminMiddleware, async (req, res) => {
-    const { id } = req.params
-
+    const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
     try {
         const deletedProduct = await Product.findByIdAndDelete(id);
-        if (!deletedProduct) {
-            return res.status(404).json({ message: "Product not found! 🔴" });
-        }
+        if (!deletedProduct) return res.status(404).json({ message: "Product not found! 🔴" });
         res.status(200).json({ message: "Product deleted successfully! 🟢", product: deletedProduct });
     } catch (error) {
-        if (error.code === 11000) {
-            return res.status(409).json({ status: 'error', message: "Error: El SKU que intentas asignar ya está siendo usado por otro producto. 🔴" });
-        }
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = DELETE /:id:`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_DELETING_PRODUCT! 🔴"});
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_DELETING_PRODUCT! 🔴" });
     }
-})
+});
 
 // MASSIVE DELETE
 productRouter.delete("/api/bulk-delete", adminMiddleware, async (req, res) => {
     const { ids } = req.body;
-
     if (!Array.isArray(ids) || ids.length === 0) {
-        return res.status(400).json({ 
-            message: "Debes seleccionar al menos un producto para eliminar. 🔴" 
-        });
+        return res.status(400).json({ message: "Debes seleccionar al menos un producto para eliminar. 🔴" });
     }
     try {
-        const result = await Product.deleteMany({ _id: { $in: ids } }); 
+        const result = await Product.deleteMany({ _id: { $in: ids.filter(id => mongoose.Types.ObjectId.isValid(id)) } });
         res.status(200).json({ message: "Massive delete made successfully! 🟢", detalles: { total_seleccionados: ids.length, total_eliminados: result.deletedCount } });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] 🚨 ERROR en bulk-delete:`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_IN_BULK_DELETE! 🔴"});
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_IN_BULK_DELETE! 🔴" });
     }
 });
 
-// GET EXPORT CSV
-productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) => {
-    try {
-        const productos = await Product.find({}).lean();
-        const BOM = '\uFEFF';
-        
-        const headers = [
-            "_id", "nombre", "marca", "sku_padre", "estado", "precio_base", 
-            "stock_base", "en_promocion", "porcentaje_promo",
-            "categorias", "descripcion", "imagenes_generales", 
-            "peso", "ancho", "alto", "largo", 
-            "variantes"
-        ];
-
-        let csvContent = headers.join(";") + "\n";
-
-        productos.forEach(p => {
-            const categoriasStr = p.categorias ? p.categorias.join(" | ") : "";
-            const imagenesStr   = p.imagenes_generales ? p.imagenes_generales.join(" | ") : "";
-            
-            const variantesStr = p.variantes ? p.variantes.map(v => 
-                `${v.sku_variante || ''},${v.talle || ''},${v.color || ''},${v.medida || ''},${v.stock || 0},${v.precio_adicional || 0},${v.foto_variante || ''}`
-            ).join(" | ") : "";
-
-            const row = [
-                p._id,
-                `"${p.nombre}"`,
-                `"${p.marca}"`,
-                `"${p.sku_padre}"`,
-                p.estado,
-                p.precio_base,
-                p.stock_base || 0,
-                p.en_promocion ? "true" : "false",
-                p.porcentaje_promo || 0,
-                `"${categoriasStr}"`,
-                `"${(p.descripcion || "").replace(/;/g, ',').replace(/\n/g, ' ')}"`,
-                `"${imagenesStr}"`,
-                p.medidas_empaque?.peso || 0,
-                p.medidas_empaque?.ancho || 0,
-                p.medidas_empaque?.alto || 0,
-                p.medidas_empaque?.largo || 0,
-                `"${variantesStr}"`
-            ];
-
-            csvContent += row.join(";") + "\n";
-        });
-
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', 'attachment; filename=productos_db.csv');
-        return res.status(200).send(BOM + csvContent);
-
-    } catch (error) {
-        console.error(`[${new Date().toISOString()}] ERROR en EXPORT CSV = GET`, error);
-        res.status(500).json({ message: "Error al exportar" });
-    }
-});
-
-// UPLOAD EXPORT CSV
-productRouter.post("/api/products/bulk-import", upload.single('archivo'), adminMiddleware, async (req, res) => {
+// IMPORT CSV — admin primero, después se acepta el archivo
+productRouter.post("/api/products/bulk-import", adminMiddleware, upload.single('archivo'), async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "Archivo no encontrado" });
 
-    const resultados = [];
-    let procesados = 0;
+    const borrarArchivo = () => { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); };
+    const splitList = (s) => String(s || "").split("|").map(x => x.trim()).filter(Boolean);
 
-    const procesar = () => {
-        return new Promise((resolve, reject) => {
-            fs.createReadStream(req.file.path)
-                .pipe(csv({ separator: ';' }))
-                .on('data', (data) => resultados.push(data))
-                .on('end', async () => {
-                    try {
-                        for (const fila of resultados) {
-                            if (!fila.sku_padre) continue;
-
-                            let variantesArray = [];
-                            if (fila.variantes && fila.variantes.trim() !== "") {
-                                variantesArray = fila.variantes.split('|').map(vStr => {
-                                    const campos = vStr.split(',').map(s => s.trim());
-                                    return {
-                                        sku_variante:     campos[0],
-                                        talle:            campos[1] || null,
-                                        color:            campos[2] || null,
-                                        medida:           campos[3] || null,
-                                        gb:               campos[4] || null,
-                                        largo_cable:      campos[5] || null,
-                                        stock:            Number(campos[6]) || 0,
-                                        precio_adicional: Number(campos[7]) || 0,
-                                        foto_variante:    campos[8] || null
-                                    };
-                                }).filter(v => v.sku_variante);
-                            }
-
-                            const datosProducto = {
-                                nombre:            fila.nombre?.replace(/"/g, ''),
-                                marca:             fila.marca?.replace(/"/g, ''),
-                                sku_padre:         fila.sku_padre.trim().replace(/"/g, ''),
-                                precio_base:       Number(fila.precio_base) || 0,
-                                stock_base:        Number(fila.stock_base) || 0,
-                                en_promocion:      fila.en_promocion === 'true',
-                                porcentaje_promo:  Number(fila.porcentaje_promo) || 0,
-                                estado:            fila.estado || 'activo',
-                                descripcion:       fila.descripcion?.replace(/"/g, ''),
-                                categorias:        fila.categorias ? fila.categorias.replace(/"/g, '').split('|').map(c => c.trim()) : [],
-                                imagenes_generales:fila.imagenes_generales ? fila.imagenes_generales.replace(/"/g, '').split('|').map(i => i.trim()) : [],
-                                variantes:         variantesArray,
-                                medidas_empaque: {
-                                    peso:  Number(fila.peso)  || 0,
-                                    ancho: Number(fila.ancho) || 0,
-                                    alto:  Number(fila.alto)  || 0,
-                                    largo: Number(fila.largo) || 0
-                                }
-                            };
-
-                            await Product.findOneAndUpdate(
-                                { sku_padre: datosProducto.sku_padre },
-                                { $set: datosProducto },
-                                { upsert: true, runValidators: true }
-                            );
-                            procesados++;
-                        }
-                        resolve();
-                    } catch (err) { reject(err); }
-                });
-        });
+    // Formato nuevo: "SKU ~ stock ~ extra ~ color: Azul / capacidad: 128GB"
+    // Formato viejo: "SKU,talle,color,medida,stock,extra,foto"
+    const parseVariante = (seg) => {
+        if (seg.includes("~")) {
+            const [sku, stock, extra, attrs = ""] = seg.split("~").map(s => s.trim());
+            const atributos = attrs.split(" / ").map(par => {
+                const i = par.indexOf(":");
+                return i > 0 ? { nombre: par.slice(0, i).trim(), valor: par.slice(i + 1).trim() } : null;
+            }).filter(Boolean);
+            return { sku_variante: sku, stock: toNum(stock) || 0, precio_adicional: toNum(extra) || 0, atributos };
+        }
+        const c = seg.split(",").map(s => s.trim());
+        const atributos = [["talle", c[1]], ["color", c[2]], ["medida", c[3]]]
+            .filter(([, v]) => v).map(([nombre, valor]) => ({ nombre, valor }));
+        return { sku_variante: c[0], stock: toNum(c[4]) || 0, precio_adicional: toNum(c[5]) || 0, foto_variante: c[6] || null, atributos };
     };
 
     try {
-        await procesar();
-        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        res.status(200).json({ message: `Se procesaron ${procesados} productos correctamente.` });
+        const filas = await new Promise((resolve, reject) => {
+            const out = [];
+            fs.createReadStream(req.file.path)
+                .pipe(csv({ separator: ';', mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
+                .on('data', (d) => out.push(d))
+                .on('end', () => resolve(out))
+                .on('error', reject);
+        });
+
+        let procesados = 0;
+        const errores = [];
+
+        for (const [i, fila] of filas.entries()) {
+            const sku = String(fila.sku_padre || "").trim();
+            if (!sku) continue;
+
+            const raw = {
+                nombre:             fila.nombre,
+                marca:              fila.marca,
+                sku_padre:          sku,
+                descripcion:        fila.descripcion,
+                precio_base:        fila.precio_base,
+                stock_base:         fila.stock_base,
+                en_promocion:       fila.en_promocion === "true",
+                porcentaje_promo:   fila.porcentaje_promo,
+                estado:             fila.estado,
+                categorias:         splitList(fila.categorias),
+                imagenes_generales: splitList(fila.imagenes_generales),
+                medidas_empaque:    { peso: fila.peso, ancho: fila.ancho, alto: fila.alto, largo: fila.largo },
+                variantes:          splitList(fila.variantes).map(parseVariante),
+            };
+
+            const existing = await Product.findOne({ sku_padre: sku });
+
+            // conservar los _id de variantes existentes (carritos y favoritos apuntan a ellos)
+            if (existing) {
+                raw.variantes.forEach(v => {
+                    const prev = existing.variantes.find(x => x.sku_variante.toUpperCase() === String(v.sku_variante).toUpperCase());
+                    if (prev) v._id = prev._id;
+                });
+            }
+
+            const { data, errors } = sanitizeProductPayload(raw);
+            if (errors.length) { errores.push(`Fila ${i + 2} (${sku}): ${errors[0]}`); continue; }
+
+            try {
+                if (existing) {
+                    delete data.faqs;              // el CSV no trae FAQs: se conservan las cargadas
+                    existing.set(data);
+                    await existing.save();
+                } else {
+                    await Product.create(data);
+                }
+                registrarAtributos(data.opciones);
+                procesados++;
+            } catch (err) {
+                errores.push(`Fila ${i + 2} (${sku}): ${err.code === 11000 ? "SKU duplicado" : err.message}`);
+            }
+        }
+
+        borrarArchivo();
+        res.status(200).json({
+            message: `Se procesaron ${procesados} productos${errores.length ? ` · ${errores.length} con errores` : ""}.`,
+            errores: errores.slice(0, 50),
+        });
     } catch (error) {
-        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        borrarArchivo();
         console.error(`[${new Date().toISOString()}] ERROR en IMPORT CSV = POST`, error);
         res.status(500).json({ message: "Error en importación", error: error.message });
     }
 });
 
-// CATEGORIA CREATE
+/* ════════════════════════════════════════════════════════════════════════════
+   CATEGORÍAS
+════════════════════════════════════════════════════════════════════════════ */
 productRouter.post("/api/categories", adminMiddleware, async (req, res) => {
     try {
         const { nombre } = req.body;
         const nuevaCategoria = new Category({ nombre });
-        await nuevaCategoria.save(); 
+        await nuevaCategoria.save();
         res.status(201).json(nuevaCategoria);
     } catch (error) {
         if (error.code === 11000) {
@@ -438,18 +589,16 @@ productRouter.post("/api/categories", adminMiddleware, async (req, res) => {
     }
 });
 
-// READ CATEGORÍA
 productRouter.get("/api/categories", async (req, res) => {
     try {
         const categorias = await Category.find();
         res.status(200).json({ message: "Categories found successfully! 🟢", categorias });
-    } catch(error) {
+    } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter LEER CATEGORIAS = GET :`, error);
-        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴"});
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
     }
-})
+});
 
-// BORRAR CATEGORÍA
 productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) => {
     try {
         await Category.findByIdAndDelete(req.params.id);
@@ -461,16 +610,14 @@ productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) =>
     }
 });
 
-// FAVORITOS
+/* ════════════════════════════════════════════════════════════════════════════
+   FAVORITOS
+════════════════════════════════════════════════════════════════════════════ */
 productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
-    console.log("BODY COMPLETO:", JSON.stringify(req.body, null, 2));
-    const { nombre, userEmail, productId, isFavorite, img } = req.body;
-    console.log("IMG RECIBIDO:", img, typeof img);
-    console.log("FAVORITO", req.body);
-    
-    if (!userEmail || !productId) {
-        return res.status(400).json({ message: "Faltan datos requeridos" });
-    }
+    const { nombre, productId, isFavorite, img } = req.body;
+    const userEmail = req.user?.email?.toLowerCase();
+
+    if (!userEmail || !productId) return res.status(400).json({ message: "Faltan datos requeridos" });
 
     try {
         if (isFavorite) {
@@ -478,21 +625,22 @@ productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
             await newFavorite.save();
             return res.status(201).json({ message: "Agregado a favoritos", active: true });
         } else {
-            await Favorite.findOneAndDelete({ nombre, userEmail, productId });
+            await Favorite.findOneAndDelete({ userEmail, productId });
             return res.status(200).json({ message: "Eliminado de favoritos", active: false });
         }
     } catch (error) {
-        if (error.code === 11000) {
-            return res.status(200).json({ message: "Ya estaba en favoritos", active: true });
-        }
+        if (error.code === 11000) return res.status(200).json({ message: "Ya estaba en favoritos", active: true });
         console.error(`[${new Date().toISOString()}] ERROR AL GUARDAR FAVORITOS, POST`, error);
-        res.status(500).json({ message: "Error en el servidor", error });
+        res.status(500).json({ message: "Error en el servidor" });
     }
 });
 
 productRouter.get('/api/product/fav/:email', verifyToken, async (req, res) => {
+    if (req.user?.email?.toLowerCase() !== String(req.params.email).toLowerCase()) {
+        return res.status(403).json({ message: "Sin permiso 🔴" });
+    }
     try {
-        const favorites = await Favorite.find({ userEmail: req.params.email })
+        const favorites = await Favorite.find({ userEmail: req.params.email.toLowerCase() });
         res.status(200).json(favorites);
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR AL OBTENER FAVORITOS, GET`, error);
@@ -500,114 +648,148 @@ productRouter.get('/api/product/fav/:email', verifyToken, async (req, res) => {
     }
 });
 
-// FILTROS
+/* ════════════════════════════════════════════════════════════════════════════
+   TIENDA — FILTROS
+   ?attr=color:Azul,capacidad:128GB  → filtra por características de una misma variante
+   ?talle=M                           → compatibilidad con el filtro anterior
+════════════════════════════════════════════════════════════════════════════ */
 productRouter.get('/api/products/brands', async (req, res) => {
     try {
         const brands = await Product.distinct('marca', { estado: 'activo' });
         res.status(200).json(brands.sort());
     } catch (error) {
-        console.error(`[${new Date().toISOString()}] ERROR AL OBTENER PRODUCTOR POR FILTRO DE MARCA, GET /brands`, error);
+        console.error(`[${new Date().toISOString()}] ERROR AL OBTENER MARCAS, GET /brands`, error);
+        res.status(500).json([]);
+    }
+});
+
+// Valores disponibles por característica para armar filtros en la tienda
+productRouter.get('/api/products/attribute-filters', async (req, res) => {
+    try {
+        const rows = await Product.aggregate([
+            { $match: { estado: 'activo' } },
+            { $unwind: "$variantes" },
+            { $match: { "variantes.activo": { $ne: false } } },
+            { $unwind: "$variantes.atributos" },
+            { $group: { _id: "$variantes.atributos.nombre", valores: { $addToSet: "$variantes.atributos.valor" } } },
+            { $sort: { _id: 1 } },
+        ]);
+        res.status(200).json(rows.map(r => ({ nombre: r._id, valores: r.valores.sort() })));
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR attribute-filters`, error);
         res.status(500).json([]);
     }
 });
 
 productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, res) => {
     try {
-        const { limit = 20, offset = 0, nombre, marca, categoria, talle, minPre, maxPre, promo, stock } = req.query;
-        let query = { estado: 'activo' };
+        const { nombre, marca, categoria, talle, attr, minPre, maxPre, promo, stock } = req.query;
+        const limit  = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+        const offset = Math.max(Number(req.query.offset) || 0, 0);
+        const query  = { estado: 'activo' };
+        const and    = [];
 
-        // ── BÚSQUEDA POR STRING ───────────────────────────────────
-        if (nombre && nombre !== "") {
-            const terminos = nombre.trim().split(/\s+/).filter(Boolean);
+        // ── BÚSQUEDA POR TEXTO ──
+        if (nombre && String(nombre).trim()) {
+            const terminos = String(nombre).trim().split(/\s+/).filter(Boolean).slice(0, 6);
 
-            const condicionesPorTermino = terminos.map(termino => {
-                const fuzzyRegex = termino.length <= 3
-                    ? new RegExp(termino, 'i')
-                    : new RegExp(
-                        termino.split('').map((_, i) =>
-                            termino.slice(0, i) + '.?' + termino.slice(i + 1)
-                        ).join('|') + '|' + termino,
-                        'i'
-                    );
+            terminos.forEach(termino => {
+                const t = escapeRegex(termino);
+                const fuzzy = termino.length >= 4
+                    ? new RegExp(termino.split('').map((_, i) => escapeRegex(termino.slice(0, i)) + '.?' + escapeRegex(termino.slice(i + 1))).join('|') + '|' + t, 'i')
+                    : null;
 
-                return {
+                and.push({
                     $or: [
-                        { nombre:                   { $regex: termino, $options: 'i' } },
-                        { marca:                    { $regex: termino, $options: 'i' } },
-                        { sku_padre:                { $regex: termino, $options: 'i' } },
-                        { descripcion:              { $regex: termino, $options: 'i' } },
-                        { categorias:               { $regex: termino, $options: 'i' } },
-                        { 'variantes.talle':        { $regex: termino, $options: 'i' } },
-                        { 'variantes.color':        { $regex: termino, $options: 'i' } },
-                        { 'variantes.medida':       { $regex: termino, $options: 'i' } },
-                        { 'variantes.gb':           { $regex: termino, $options: 'i' } },
-                        { 'variantes.largo_cable':  { $regex: termino, $options: 'i' } },
-                        { 'variantes.sku_variante': { $regex: termino, $options: 'i' } },
-                        ...(termino.length >= 4 ? [
-                            { nombre:     { $regex: fuzzyRegex } },
-                            { marca:      { $regex: fuzzyRegex } },
-                            { categorias: { $regex: fuzzyRegex } },
-                        ] : [])
+                        { nombre:      { $regex: t, $options: 'i' } },
+                        { marca:       { $regex: t, $options: 'i' } },
+                        { sku_padre:   { $regex: t, $options: 'i' } },
+                        { descripcion: { $regex: t, $options: 'i' } },
+                        { categorias:  { $regex: t, $options: 'i' } },
+                        { 'variantes.atributos.valor': { $regex: t, $options: 'i' } },
+                        { 'variantes.sku_variante':    { $regex: t, $options: 'i' } },
+                        ...(fuzzy ? [{ nombre: { $regex: fuzzy } }, { marca: { $regex: fuzzy } }, { categorias: { $regex: fuzzy } }] : [])
                     ]
-                };
+                });
             });
-
-            query.$and = condicionesPorTermino;
         }
 
-        // ── FILTROS EXACTOS ───────────────────────────────────────
-        if (marca     && marca !== "")     query.marca      = { $regex: new RegExp(`^${marca}$`, 'i') };
-        if (categoria && categoria !== "") query.categorias = { $regex: new RegExp(`^${categoria}$`, 'i') };
-        if (promo === 'true')              query.en_promocion = true;
+        // ── FILTROS EXACTOS ──
+        if (marca)     query.marca      = { $regex: new RegExp(`^${escapeRegex(marca)}$`, 'i') };
+        if (categoria) query.categorias = { $regex: new RegExp(`^${escapeRegex(categoria)}$`, 'i') };
+        if (promo === 'true') query.en_promocion = true;
 
         if (minPre || maxPre) {
             query.precio_base = {};
-            if (minPre && minPre !== "") query.precio_base.$gte = Number(minPre);
-            if (maxPre && maxPre !== "") query.precio_base.$lte = Number(maxPre);
+            if (minPre) query.precio_base.$gte = Number(minPre);
+            if (maxPre) query.precio_base.$lte = Number(maxPre);
         }
 
         if (stock === 'true') {
-            query.$or = [{ stock_base: { $gt: 0 } }, { 'variantes.stock': { $gt: 0 } }];
+            and.push({ $or: [{ stock_base: { $gt: 0 } }, { variantes: { $elemMatch: { stock: { $gt: 0 }, activo: { $ne: false } } } }] });
         }
 
-        if (talle && talle !== "") query['variantes.talle'] = talle;
+        // ── CARACTERÍSTICAS DE VARIANTE ──
+        const pares = [];
+        if (talle) pares.push(["talle", String(talle)]);
+        if (attr) {
+            String(attr).split(",").forEach(par => {
+                const i = par.indexOf(":");
+                if (i > 0) pares.push([par.slice(0, i).trim().toLowerCase(), par.slice(i + 1).trim()]);
+            });
+        }
+        if (pares.length) {
+            and.push({
+                variantes: {
+                    $elemMatch: {
+                        activo: { $ne: false },
+                        $and: pares.map(([n, v]) => ({
+                            atributos: { $elemMatch: { nombre: n, valor: { $regex: new RegExp(`^${escapeRegex(v)}$`, 'i') } } }
+                        }))
+                    }
+                }
+            });
+        }
 
-        // ── QUERY ─────────────────────────────────────────────────
+        if (and.length) query.$and = and;
+
         const [products, total] = await Promise.all([
-            Product.find(query).sort({ createdAt: -1 }).limit(Number(limit)).skip(Number(offset)),
+            Product.find(query).sort({ createdAt: -1 }).limit(limit).skip(offset),
             Product.countDocuments(query)
         ]);
 
-        res.status(200).json({ products, total });
+        res.status(200).json({ message: "Products fetched successfully! 🟢", products, total });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR productRouter GET [ limit-filter ]`, error);
         res.status(500).json({ error: "INTERNAL_ERROR" });
     }
 });
 
-// RESEÑAS PRODUCTOS
+/* ════════════════════════════════════════════════════════════════════════════
+   RESEÑAS
+════════════════════════════════════════════════════════════════════════════ */
 productRouter.post("/api/product/rating", verifyToken, async (req, res) => {
-    const { reviewData } = req.body
+    const { reviewData } = req.body;
     try {
-        if(!reviewData){
-            return res.status(400).json({ message: "All fields are required to create a product review! 🔴" })
+        if (!reviewData) {
+            return res.status(400).json({ message: "All fields are required to create a product review! 🔴" });
         }
-        const review = await Reseñas.create(reviewData)
-        res.status(201).json({ message: "Review created successfully! 🟢", review })
+        const review = await Reseñas.create(reviewData);
+        res.status(201).json({ message: "Review created successfully! 🟢", review });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR AL CREAR REVIEW DE PRODUCTO`, error);
         res.status(500).json({ error: "INTERNAL_ERROR_PRODUCT REVIEW" });
     }
-})
+});
 
 productRouter.get("/api/product-reviews", async (req, res) => {
     try {
-        const reviews = await Reseñas.find()
-        res.status(200).json({ message: "Reviews downloaded successfully! 🟢", reviews })
+        const reviews = await Reseñas.find();
+        res.status(200).json({ message: "Reviews downloaded successfully! 🟢", reviews });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR TRAER REVIEWS DE PRODUCTO`, error);
-        res.status(500).json({ error: "INTERNAL ERROR TRAER REVIEWs DE PRODUCTO" });   
+        res.status(500).json({ error: "INTERNAL ERROR TRAER REVIEWs DE PRODUCTO" });
     }
-})
+});
 
 module.exports = productRouter;
