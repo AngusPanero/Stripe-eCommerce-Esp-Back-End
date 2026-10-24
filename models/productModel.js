@@ -1,14 +1,5 @@
 const mongoose = require('mongoose');
 
-/* ════════════════════════════════════════════════════════════════════════════
-   productModel.js
-   ─ Producto ÚNICO  → variantes: []  · usa stock_base
-   ─ Con VARIANTES   → mínimo 2 variantes · cada una con sus atributos libres
-                       (color, talle, capacidad... lo que el vendedor quiera)
-                       stock_base queda en 0 y el stock vive en cada variante
-════════════════════════════════════════════════════════════════════════════ */
-
-// Característica de una variante: { nombre: "color", valor: "Azul" }
 const atributoSchema = new mongoose.Schema({
     nombre: { type: String, required: true, trim: true, lowercase: true, maxlength: 40 },
     valor:  { type: String, required: true, trim: true, maxlength: 60 },
