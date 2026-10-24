@@ -2,7 +2,7 @@
    stripeRouter.js — Cobros con Stripe (PaymentIntents + Webhook)
 
    FLUJO
-   1. POST /stripe-create-payment-intent  (usuario logueado)
+   1. POST /stripe-create-payment-intent  (con cuenta O como invitado)
       → el backend calcula TODO (precios, promo, cupón, envío) en céntimos,
         crea el pedido en estado "pending" y el PaymentIntent.
         El front solo manda: productId, varianteId, cantidad, couponCode,
@@ -14,6 +14,15 @@
       Si algo falla devolvemos 500 → Stripe reintenta. El pedido ya existe,
       así que nunca queda un pago sin rastro.
    4. GET /stripe-order-status/:orderId → el front consulta el estado real.
+
+   INVITADOS (sin sesión)
+   · Pueden cotizar y pagar. El email llega en el body y se valida.
+   · NO pueden usar cupones (los cupones se registran con el email de la cuenta).
+   · El stock nunca se reserva: se comprueba al cotizar / crear el pago y se
+     descuenta en el webhook de forma condicional (igual que con cuenta).
+   · El pedido lleva un statusToken (se guarda solo su hash). Con él el
+     invitado consulta el estado y reutiliza el pedido si reintenta.
+   · Nunca se toca el carrito en BD de una cuenta con ese mismo email.
 
    ADMIN
    GET  /api/admin/orders                  listado (filtros status / needsReview)
@@ -28,6 +37,7 @@
 
 const express    = require("express");
 const mongoose   = require("mongoose");
+const crypto     = require("crypto");
 const nodemailer = require("nodemailer");
 const Stripe     = require("stripe");
 
@@ -65,6 +75,10 @@ const OPEN_STATUSES        = ["pending", "in_process", "rejected"];
 const STORE_NAME  = process.env.STORE_NAME || "Dekin Hogar";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_FROM;
 
+// cookie(s) de sesión que lee authMiddleware (separadas por coma en el .env)
+const SESSION_COOKIES = (process.env.SESSION_COOKIE_NAMES || "token")
+    .split(",").map(s => s.trim()).filter(Boolean);
+
 // ════════════════════════════════════════════════════════════════════════════
 //  HELPERS
 // ════════════════════════════════════════════════════════════════════════════
@@ -74,6 +88,16 @@ const formatEUR = (cents) => fromCents(cents).toLocaleString("es-ES", { style: "
 const isId      = (v)     => mongoose.Types.ObjectId.isValid(String(v || ""));
 const capitalize = (s)    => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 const cleanStr  = (v, max = 200) => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, max) : "");
+
+const EMAIL_RE   = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const cleanEmail = (v) => {
+    const e = typeof v === "string" ? v.trim().toLowerCase() : "";
+    return e.length <= 254 && EMAIL_RE.test(e) ? e : null;
+};
+
+// token para que un invitado consulte / reutilice SU pedido (se guarda solo el hash)
+const newStatusToken = () => crypto.randomBytes(24).toString("hex");
+const hashToken      = (t) => crypto.createHash("sha256").update(String(t)).digest("hex");
 
 class CheckoutError extends Error {
     constructor(status, message, code = "CHECKOUT") {
@@ -98,6 +122,34 @@ function unitPriceCents(product, variante = null) {
 
 function pushHistory(order, status, note) {
     order.history.push({ at: new Date(), status, note });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AUTH OPCIONAL — si trae credenciales se valida con verifyToken (un token
+//  inválido sigue dando 401); si no trae ninguna, entra como invitado.
+// ════════════════════════════════════════════════════════════════════════════
+function leerCookie(req, nombre) {
+    if (req.cookies && req.cookies[nombre]) return req.cookies[nombre];   // con cookie-parser
+    const par = (req.headers.cookie || "").split(";").map(c => c.trim()).find(c => c.startsWith(`${nombre}=`));
+    return par ? decodeURIComponent(par.slice(nombre.length + 1)) : null;
+}
+
+function traeCredenciales(req) {
+    if (/^Bearer\s+\S+/i.test(req.headers.authorization || "")) return true;
+    return SESSION_COOKIES.some(n => !!leerCookie(req, n));
+}
+
+function optionalAuth(req, res, next) {
+    if (!traeCredenciales(req)) {
+        req.user    = undefined;
+        req.isGuest = true;
+        return next();
+    }
+    return verifyToken(req, res, (err) => {
+        if (err) return next(err);
+        req.isGuest = !req.user?.email;
+        next();
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -188,9 +240,14 @@ async function releaseCoupon(couponId, email) {
 // ════════════════════════════════════════════════════════════════════════════
 //  COTIZACIÓN — único lugar donde se calcula el dinero
 // ════════════════════════════════════════════════════════════════════════════
-async function buildQuote({ items, couponCode, email, shippingMode = "delivery" }) {
+async function buildQuote({ items, couponCode, email, shippingMode = "delivery", guest = false }) {
     if (!Array.isArray(items) || items.length === 0) throw new CheckoutError(400, "El carrito está vacío");
     if (items.length > MAX_LINES) throw new CheckoutError(400, "Demasiados productos en el carrito");
+
+    // los cupones quedan registrados con el email de la cuenta → solo con sesión
+    if (guest && couponCode && String(couponCode).trim()) {
+        throw new CheckoutError(403, "Debes iniciar sesión para usar cupones", "COUPON");
+    }
 
     // normalizar y agrupar líneas repetidas
     const merged = new Map();
@@ -223,7 +280,7 @@ async function buildQuote({ items, couponCode, email, shippingMode = "delivery" 
         let stock;
 
         if (tieneVariantes) {
-            if (!it.varianteId) throw new CheckoutError(400, `Elegí una opción para "${p.nombre}"`);
+            if (!it.varianteId) throw new CheckoutError(400, `Elige una opción para "${p.nombre}"`);
             variante = p.variantes.find(v => String(v._id) === it.varianteId);
             if (!variante || variante.activo === false) {
                 throw new CheckoutError(404, `La opción elegida de "${p.nombre}" ya no está disponible`, "UNAVAILABLE");
@@ -403,7 +460,7 @@ function facturaHtml(o) {
     return p(`Datos de facturación: <strong style="color:#fff;">${escapeHtml(titularFactura(b))}</strong> · ${escapeHtml(tipoDoc)} ${escapeHtml(doc)}${dir ? `<br><span style="font-size:13px;color:rgba(240,235,229,.6);">${escapeHtml(dir)}</span>` : ""}`);
 }
 
-const clienteHtml = (o) => p(`Cliente: <strong style="color:#fff;">${escapeHtml(o.nombre || "-")}</strong> · ${escapeHtml(o.email)} · ${escapeHtml(o.telefono || "-")}`);
+const clienteHtml = (o) => p(`Cliente: <strong style="color:#fff;">${escapeHtml(o.nombre || "-")}</strong> · ${escapeHtml(o.email)} · ${escapeHtml(o.telefono || "-")}${o.guest ? " · <strong style=\"color:#E84B1A;\">SIN CUENTA</strong>" : ""}`);
 
 // ════════════════════════════════════════════════════════════════════════════
 //  FULFILLMENT — idempotente: Stripe puede mandar el mismo evento varias veces
@@ -474,7 +531,8 @@ async function fulfillOrder(orderId, pi) {
             }
 
             // 3. cupón: se valida OTRA VEZ y se quema solo ahora que está cobrado
-            if (order.coupon?.code && !order.couponBurned && !order.couponConflict) {
+            //    (un pedido de invitado nunca lleva cupón; se protege igual)
+            if (!order.guest && order.coupon?.code && !order.couponBurned && !order.couponConflict) {
                 const burn = await burnCoupon(order.coupon.couponId, order.email, new Date(pi.created * 1000), session);
                 if (burn.ok) {
                     order.couponBurned = true;
@@ -505,8 +563,12 @@ async function fulfillOrder(orderId, pi) {
 }
 
 async function afterPaid(order) {
-    try { await Cart.findOneAndDelete({ userEmail: order.email }); }
-    catch (err) { console.error("[STRIPE] No se pudo vaciar el carrito:", err.message); }
+    // un invitado no tiene carrito en BD; y si su email coincide con el de una
+    // cuenta, NO se debe tocar el carrito de esa cuenta
+    if (!order.guest) {
+        try { await Cart.findOneAndDelete({ userEmail: order.email }); }
+        catch (err) { console.error("[STRIPE] No se pudo vaciar el carrito:", err.message); }
+    }
 
     try { notifyNewSale(order); }
     catch (err) { console.error("[STRIPE] Error SSE:", err.message); }
@@ -515,7 +577,7 @@ async function afterPaid(order) {
 
     await sendMail(
         ADMIN_EMAIL,
-        `🟢 Nueva venta ${order.orderId} — ${formatEUR(order.totalCents)}${order.needsReview ? " (REVISAR)" : ""}`,
+        `🟢 Nueva venta ${order.orderId} — ${formatEUR(order.totalCents)}${order.guest ? " (sin cuenta)" : ""}${order.needsReview ? " (REVISAR)" : ""}`,
         mailLayout("Nueva venta aprobada", `${alertas}${clienteHtml(order)}${facturaHtml(order)}${orderSummaryHtml(order)}`)
     );
     await sendMail(
@@ -730,10 +792,11 @@ async function webhookHandler(req, res) {
 // ════════════════════════════════════════════════════════════════════════════
 //  POST /stripe-quote — cotización sin crear pedido (lo que muestra el checkout)
 //  Body: { items:[{productId, varianteId?, cantidad}], couponCode?, shipping:{mode} }
+//  Con o sin sesión. Sin sesión no se aceptan cupones.
 // ════════════════════════════════════════════════════════════════════════════
-stripeRouter.post("/stripe-quote", verifyToken, async (req, res) => {
-    const email = req.user?.email?.toLowerCase();
-    if (!email) return res.status(401).json({ message: "Tenés que iniciar sesión 🔴" });
+stripeRouter.post("/stripe-quote", optionalAuth, async (req, res) => {
+    const email = req.user?.email?.toLowerCase() || null;
+    const guest = !email;
 
     const { items, couponCode, shipping } = req.body || {};
     try {
@@ -741,6 +804,7 @@ stripeRouter.post("/stripe-quote", verifyToken, async (req, res) => {
             items: cartItemsToQuoteItems(items),
             couponCode,
             email,
+            guest,
             shippingMode: shipping?.mode === "pickup" ? "pickup" : "delivery",
         });
         res.status(200).json({ quote: publicQuote(quote) });
@@ -756,7 +820,8 @@ stripeRouter.post("/stripe-quote", verifyToken, async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 //  POST /stripe-create-payment-intent
 //  Body: { items:[{productId, varianteId?, cantidad}], couponCode?, shipping:{mode, address},
-//          billing?, nombre?, telefono?, orderId? (para reutilizar el pedido al cambiar el carrito) }
+//          billing?, nombre?, telefono?, orderId? (para reutilizar el pedido al cambiar el carrito),
+//          email? (solo invitados), statusToken? (solo invitados, para reutilizar su pedido) }
 // ════════════════════════════════════════════════════════════════════════════
 const ADDRESS_FIELDS = ["calle", "numero", "piso", "ciudad", "provincia", "codigoPostal", "pais", "paisCodigo"];
 
@@ -813,11 +878,11 @@ function sanitizeBilling(raw = {}, shippingAddress = null) {
     const direccion = sanitizeAddress(usarEnvio ? shippingAddress : raw?.direccion);
 
     let error = null;
-    if (type === "fisica" && (!nombre || !apellidos))      error = "Completá nombre y apellidos para la factura";
-    else if (type === "empresa" && !razonSocial)            error = "Completá la razón social para la factura";
+    if (type === "fisica" && (!nombre || !apellidos))      error = "Completa nombre y apellidos para la factura";
+    else if (type === "empresa" && !razonSocial)            error = "Completa la razón social para la factura";
     else if (!validarDocumento(tipoDocumento, documento))   error = "El documento de facturación (NIF / NIE / CIF) no es válido";
     else if (!direccion.calle || !direccion.codigoPostal || !direccion.ciudad || !direccion.pais) {
-        error = "Completá la dirección de facturación";
+        error = "Completa la dirección de facturación";
     }
 
     return {
@@ -836,18 +901,23 @@ function sanitizeBilling(raw = {}, shippingAddress = null) {
 const titularFactura = (b) =>
     b?.type === "empresa" ? b.razonSocial : [b?.nombre, b?.apellidos].filter(Boolean).join(" ");
 
-stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res) => {
-    const email = req.user?.email?.toLowerCase();
-    if (!email) return res.status(401).json({ message: "Tenés que iniciar sesión para pagar 🔴" });
+stripeRouter.post("/stripe-create-payment-intent", optionalAuth, async (req, res) => {
+    const { items, couponCode, shipping, billing, nombre, telefono, orderId, statusToken: tokenCliente } = req.body || {};
 
-    const { items, couponCode, shipping, billing, nombre, telefono, orderId } = req.body || {};
+    // con sesión el email sale del token; como invitado, del body (validado)
+    const sessionEmail = req.user?.email?.toLowerCase() || null;
+    const guest        = !sessionEmail;
+    const email        = sessionEmail || cleanEmail(req.body?.email);
+    if (!email) {
+        return res.status(400).json({ message: "Introduce un email válido: ahí te llegan la confirmación y la factura 🔴", code: "EMAIL" });
+    }
 
     try {
         const shippingMode = shipping?.mode === "pickup" ? "pickup" : "delivery";
 
         const address = sanitizeAddress(shipping?.address);
         if (shippingMode === "delivery" && (!address.calle || !address.ciudad || !address.codigoPostal || !address.pais)) {
-            return res.status(400).json({ message: "Completá la dirección de envío (calle, ciudad, código postal y país) 🔴" });
+            return res.status(400).json({ message: "Completa la dirección de envío (calle, ciudad, código postal y país) 🔴" });
         }
 
         const { data: billingData, error: billingError } = sanitizeBilling(billing, shippingMode === "delivery" ? address : null);
@@ -855,11 +925,13 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
 
         const contacto = [billingData.nombre, billingData.apellidos].filter(Boolean).join(" ");
 
-        const quote = await buildQuote({ items: cartItemsToQuoteItems(items), couponCode, email, shippingMode });
+        // buildQuote vuelve a comprobar el stock real en este momento (409 STOCK si falta)
+        const quote = await buildQuote({ items: cartItemsToQuoteItems(items), couponCode, email, guest, shippingMode });
 
         const orderData = {
-            client_id: req.user?.uid || email,
+            client_id: guest ? `guest:${email}` : (req.user?.uid || email),
             email,
+            guest,
             nombre:   contacto || titularFactura(billingData) || cleanStr(nombre, 120),
             telefono: cleanStr(telefono, 40) || "N/A",
             items: quote.lines.map(l => ({
@@ -882,11 +954,17 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
             },
             billing: billingData,
         };
-        const metadata = { orderId: "", email, couponCode: quote.coupon?.code || "" };
+        const metadata = { orderId: "", email, guest: guest ? "1" : "0", couponCode: quote.coupon?.code || "" };
 
-        // ── Reutilizar el pedido si el carrito cambió antes de pagar ──
-        if (orderId && isId(orderId)) {
-            const existing = await PaymentsMongo.findOne({ _id: orderId, email, status: { $in: ["pending", "rejected"] } });
+        // ── Reutilizar el pedido si el carrito cambió o la tarjeta fue rechazada ──
+        //    Con cuenta: el pedido debe ser de ese email.
+        //    Invitado: además tiene que presentar el statusToken de ese pedido.
+        if (orderId && isId(orderId) && (!guest || tokenCliente)) {
+            const filtro = guest
+                ? { _id: orderId, guest: true, statusTokenHash: hashToken(tokenCliente), status: { $in: ["pending", "rejected"] } }
+                : { _id: orderId, email, guest: { $ne: true }, status: { $in: ["pending", "rejected"] } };
+
+            const existing = await PaymentsMongo.findOne(filtro);
             if (existing?.stripePaymentIntentId) {
                 const pi = await stripe.paymentIntents.retrieve(existing.stripePaymentIntentId);
                 if (REUSABLE_PI_STATUSES.includes(pi.status)) {
@@ -898,20 +976,30 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
                     await existing.save();
 
                     const updated = await stripe.paymentIntents.update(pi.id, {
-                        amount:   quote.totalCents,
-                        metadata: { ...metadata, orderId: String(existing._id), orderRef: existing.orderId },
+                        amount:        quote.totalCents,
+                        receipt_email: email,
+                        metadata:      { ...metadata, orderId: String(existing._id), orderRef: existing.orderId },
                     });
-                    return res.status(200).json({ clientSecret: updated.client_secret, orderId: existing._id, orderRef: existing.orderId, quote: publicQuote(quote) });
+                    return res.status(200).json({
+                        clientSecret: updated.client_secret,
+                        orderId:      existing._id,
+                        orderRef:     existing.orderId,
+                        statusToken:  guest ? tokenCliente : undefined,
+                        quote:        publicQuote(quote),
+                    });
                 }
             }
         }
 
         // ── Pedido nuevo ──
+        const statusToken = guest ? newStatusToken() : null;
+
         const order = await PaymentsMongo.create({
             ...orderData,
+            statusTokenHash: statusToken ? hashToken(statusToken) : undefined,
             orderId: `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
             status:  "pending",
-            history: [{ at: new Date(), status: "pending", note: "Pedido creado" }],
+            history: [{ at: new Date(), status: "pending", note: guest ? "Pedido creado (sin cuenta)" : "Pedido creado" }],
         });
 
         // idempotencyKey generada en el servidor y única por pedido
@@ -927,7 +1015,13 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
         order.stripePaymentIntentId = pi.id;
         await order.save();
 
-        res.status(200).json({ clientSecret: pi.client_secret, orderId: order._id, orderRef: order.orderId, quote: publicQuote(quote) });
+        res.status(200).json({
+            clientSecret: pi.client_secret,
+            orderId:      order._id,
+            orderRef:     order.orderId,
+            statusToken:  statusToken || undefined,
+            quote:        publicQuote(quote),
+        });
 
     } catch (error) {
         if (error instanceof CheckoutError) {
@@ -940,14 +1034,20 @@ stripeRouter.post("/stripe-create-payment-intent", verifyToken, async (req, res)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  GET /stripe-order-status/:orderId — el front consulta después de confirmPayment
+//  Con cuenta: el pedido tiene que ser de su email.
+//  Invitado:   ?t=<statusToken> del pedido.
 // ════════════════════════════════════════════════════════════════════════════
-stripeRouter.get("/stripe-order-status/:orderId", verifyToken, async (req, res) => {
-    const email = req.user?.email?.toLowerCase();
+stripeRouter.get("/stripe-order-status/:orderId", optionalAuth, async (req, res) => {
+    const email = req.user?.email?.toLowerCase() || null;
+    const token = typeof req.query?.t === "string" ? req.query.t : null;
     const { orderId } = req.params;
     if (!isId(orderId)) return res.status(400).json({ message: "Pedido inválido 🔴" });
+    if (!email && !token) return res.status(401).json({ message: "No autorizado 🔴" });
 
     try {
-        let order = await PaymentsMongo.findOne({ _id: orderId, email });
+        let order = null;
+        if (email) order = await PaymentsMongo.findOne({ _id: orderId, email });
+        if (!order && token) order = await PaymentsMongo.findOne({ _id: orderId, guest: true, statusTokenHash: hashToken(token) });
         if (!order) return res.status(404).json({ message: "Pedido no encontrado 🔴" });
 
         // Si el webhook todavía no llegó, preguntamos a Stripe directamente
@@ -983,13 +1083,15 @@ stripeRouter.get("/stripe-order-status/:orderId", verifyToken, async (req, res) 
 // ════════════════════════════════════════════════════════════════════════════
 //  GET /api/orders/mine — pedidos del usuario logueado (reemplaza /tickets)
 //  El email sale del token, nunca del body ni de la URL.
+//  Los pedidos hechos sin cuenta no aparecen aquí: cualquiera puede escribir
+//  un email ajeno al comprar como invitado.
 // ════════════════════════════════════════════════════════════════════════════
 stripeRouter.get("/api/orders/mine", verifyToken, async (req, res) => {
     const email = req.user?.email?.toLowerCase();
     if (!email) return res.status(401).json({ message: "No autenticado 🔴" });
 
     try {
-        const orders = await PaymentsMongo.find({ email, status: { $nin: ["pending", "rejected", "canceled"] } })
+        const orders = await PaymentsMongo.find({ email, guest: { $ne: true }, status: { $nin: ["pending", "rejected", "canceled"] } })
             .sort({ createdAt: -1 })
             .limit(100)
             .select("orderId status items.nombre items.varianteLabel items.cantidad items.imagen items.unitCents items.lineCents items.discountCents subtotalCents discountCents shippingCents totalCents refundedCents coupon.code shipping billing paidAt createdAt invoiceSent")
@@ -1182,4 +1284,5 @@ module.exports = Object.assign(stripeRouter, {
     toCents,
     fromCents,
     CheckoutError,
+    optionalAuth,
 });
