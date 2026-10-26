@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const verifyToken     = require('../middleware/authMiddleware');
 const adminMiddleware = require('../middleware/adminMiddleware');
 const nodemailer = require("nodemailer");
+const requireSignPin = require("../middleware/requireSignPin");
 
 // Misma lógica de precios y cupones que el cobro real
 const {
@@ -34,7 +35,7 @@ const parseDay = (str, endOfDay) => {
 // CREAR NUEVO CUPÓN
 // couponData: { code, discount, type, description?, startDate?, expiryDate?, maxUses?,
 //               onePerUser?, minPurchase?, scope?, allowedProducts?, allowedCategories? }
-cartRouter.post("/api/coupons/create", adminMiddleware, async (req, res) => {
+cartRouter.post("/api/coupons/create", adminMiddleware, requireSignPin, async (req, res) => {
     const { couponData } = req.body;
 
     if (!couponData || typeof couponData !== 'object') {
@@ -205,7 +206,7 @@ cartRouter.patch("/api/coupons/:id/toggle", adminMiddleware, async (req, res) =>
 });
 
 // ELIMINAR CUPÓN
-cartRouter.delete("/api/coupons/:id", adminMiddleware, async (req, res) => {
+cartRouter.delete("/api/coupons/:id", adminMiddleware, requireSignPin, async (req, res) => {
     try {
         await Coupon.findByIdAndDelete(req.params.id);
         res.status(200).json({ message: "Cupón eliminado correctamente 🟢" });

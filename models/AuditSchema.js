@@ -12,7 +12,7 @@ const AuditSchema = new mongoose.Schema({
   },
   event: {
     type: String,
-    enum: [ "login", "logout", "token_refresh", "login_failed", "session_expired", "forced_logout", "invalid_token" ],
+    enum: [ "login", "logout", "token_refresh", "login_failed", "session_expired", "forced_logout", "invalid_token", "password-changed" ],
     required: true,
     index: true
   },

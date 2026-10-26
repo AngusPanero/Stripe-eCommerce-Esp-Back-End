@@ -47,3 +47,4 @@ venv/
 
 # --- Make Admin ---
 makeAdmin.js
+generateSignPinHash.js

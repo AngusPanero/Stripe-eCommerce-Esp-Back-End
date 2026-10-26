@@ -49,7 +49,7 @@ paymentsRouter.get("/all-tickets", adminMiddleware, async (req, res) => {
     }
 });
 
-// TEST REAL PAYMENT
+/* // TEST REAL PAYMENT
 paymentsRouter.post("/test-payment-complete", async (req, res) => {
     const {
         payer, idempotencyKey,
@@ -344,7 +344,7 @@ paymentsRouter.post("/test-payment-complete", async (req, res) => {
         console.error(`❌ [STRIPE TEST ERROR]:`, error.message);
         res.status(500).json({ error: "Error en la simulación", details: error.message });
     }
-});
+}); */
 
 paymentsRouter.patch("/api/payments/:id/checked", adminMiddleware, async (req, res) => {
     await PaymentsMongo.findByIdAndUpdate(req.params.id, { checked: req.body.checked });
