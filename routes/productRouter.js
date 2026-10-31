@@ -6,12 +6,22 @@ const Attribute = require("../models/AttributeSchema");
 const Favorite  = require("../models/FavoriteSchema");
 const Reseñas   = require("../models/ReseñasSchema");
 const mongoose  = require('mongoose');
+const crypto    = require('crypto');
 
-// CSV
+// CSV — solo .csv, hasta 10 MB, un archivo
 const multer = require('multer');
 const csv    = require('csv-parser');
 const fs     = require('fs');
-const upload = multer({ dest: 'uploads/', limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({
+    dest: 'uploads/',
+    limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+    fileFilter: (req, file, cb) => {
+        const ok = /\.csv$/i.test(file.originalname) &&
+            ["text/csv", "application/vnd.ms-excel", "text/plain", "application/csv", "application/octet-stream"].includes(file.mimetype);
+        cb(ok ? null : Object.assign(new Error("Solo se aceptan archivos .csv"), { code: "INVALID_TYPE" }), ok);
+    },
+});
+const MAX_CSV_ROWS = 2000;
 
 const adminMiddleware = require("../middleware/adminMiddleware");
 const verifyToken     = require("../middleware/authMiddleware");
@@ -35,6 +45,42 @@ const toNum = (v) => {
 };
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const isHttps = (u) => typeof u === "string" && /^https:\/\//i.test(u.trim());
+const isId    = (v) => typeof v === "string" && /^[a-f\d]{24}$/i.test(v);
+// query string: si llega repetida (?x=a&x=b) es un array → se toma solo si es string
+const qStr    = (v, max = 100) => (typeof v === "string" ? v.slice(0, max) : "");
+
+// Límites de las acciones masivas
+const MAX_BULK_IDS   = 500;
+const MAX_PRICE_UP   = 500;    // +500 % como máximo en un ajuste masivo
+const MAX_PRICE_DOWN = -90;    // -90 % como máximo
+const MAX_STOCK_DELTA = 100000;
+
+// Freno simple en memoria por clave (uid), mismo patrón que cupones y contacto
+function crearLimite(max, ventanaMs) {
+    const mapa = new Map();
+    return {
+        bloqueado(k) {
+            const r = mapa.get(k);
+            if (!r) return false;
+            if (Date.now() - r.first > ventanaMs) { mapa.delete(k); return false; }
+            return r.count >= max;
+        },
+        sumar(k) {
+            const now = Date.now();
+            const r = mapa.get(k);
+            if (!r || now - r.first > ventanaMs) mapa.set(k, { count: 1, first: now });
+            else r.count += 1;
+            if (mapa.size > 5000) for (const [kk, v] of mapa) if (now - v.first > ventanaMs) mapa.delete(kk);
+        },
+    };
+}
+const limiteResenas = crearLimite(5, 60 * 60 * 1000);   // 5 reseñas por usuario por hora
+
+// "marcelo@gmail.com" → "ma•••@gmail.com" (las reseñas son públicas)
+const enmascararEmail = (e) => {
+    const [u = "", d = ""] = String(e || "").split("@");
+    return d ? `${u.slice(0, 2)}•••@${d}` : "anónimo";
+};
 
 function sanitizeProductPayload(raw = {}) {
     const errors = [];
@@ -152,7 +198,7 @@ function sanitizeProductPayload(raw = {}) {
                 foto_variante:    isHttps(v?.foto_variante) ? v.foto_variante.trim() : null,
                 activo:           v?.activo !== false,
             };
-            if (v?._id && mongoose.Types.ObjectId.isValid(v._id)) out._id = v._id;   // conserva el id (carritos/favoritos)
+            if (v?._id && isId(String(v._id))) out._id = String(v._id);   // conserva el id (carritos/favoritos)
             variantes.push(out);
         });
 
@@ -221,13 +267,85 @@ productRouter.get("/api/attributes", adminMiddleware, async (req, res) => {
     }
 });
 
-// READ ALL
+// FIRMA PARA SUBIR IMÁGENES A CLOUDINARY (solo admin)
+// Reemplaza al preset "unsigned": con él, cualquiera que viera el cloud name y el nombre
+// del preset en el bundle del front podía subir archivos a tu cuenta (incluido SVG).
+// La firma dura 1 hora, fija la carpeta y solo deja subir JPG, PNG o WEBP.
+const CLOUDINARY_FOLDER  = process.env.CLOUDINARY_FOLDER || "dekin/products";
+const CLOUDINARY_FORMATS = "jpg,jpeg,png,webp";
+
+// Acepta las dos formas en que Cloudinary entrega las credenciales:
+//   · CLOUDINARY_URL=cloudinary://API_KEY:API_SECRET@CLOUD_NAME   (copiada tal cual del panel)
+//   · CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET
+// Si están las dos, mandan las variables sueltas.
+function cloudinaryConfig() {
+    let cloudName = process.env.CLOUDINARY_CLOUD_NAME || "";
+    let apiKey    = process.env.CLOUDINARY_API_KEY || "";
+    let apiSecret = process.env.CLOUDINARY_API_SECRET || "";
+
+    if ((!cloudName || !apiKey || !apiSecret) && process.env.CLOUDINARY_URL) {
+        try {
+            const u = new URL(process.env.CLOUDINARY_URL.trim());
+            if (u.protocol === "cloudinary:") {
+                cloudName = cloudName || u.hostname;
+                apiKey    = apiKey    || decodeURIComponent(u.username);
+                apiSecret = apiSecret || decodeURIComponent(u.password);
+            }
+        } catch { /* formato inválido: se avisa abajo */ }
+    }
+    return cloudName && apiKey && apiSecret ? { cloudName, apiKey, apiSecret } : null;
+}
+
+// Aviso al arrancar (sin mostrar el secret) para no enterarse recién al subir una foto
+if (!cloudinaryConfig()) {
+    console.warn("⚠️ [CLOUDINARY] Sin credenciales: definí CLOUDINARY_URL o CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET. La subida de imágenes del panel no va a funcionar.");
+}
+
+productRouter.post("/api/admin/upload-signature", adminMiddleware, (req, res) => {
+    const cfg = cloudinaryConfig();
+    if (!cfg) {
+        console.error("[CLOUDINARY] Faltan credenciales en el .env (CLOUDINARY_URL o las tres variables sueltas)");
+        return res.status(500).json({ message: "Subida de imágenes no configurada 🔴" });
+    }
+    const { cloudName: CLOUDINARY_CLOUD_NAME, apiKey: CLOUDINARY_API_KEY, apiSecret: CLOUDINARY_API_SECRET } = cfg;
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    // Cloudinary firma los parámetros ordenados alfabéticamente: k=v&k=v + secret (SHA-1)
+    const params = { allowed_formats: CLOUDINARY_FORMATS, folder: CLOUDINARY_FOLDER, timestamp };
+    const aFirmar = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join("&");
+    const signature = crypto.createHash("sha1").update(aFirmar + CLOUDINARY_API_SECRET).digest("hex");
+
+    res.set("Cache-Control", "no-store");
+    return res.status(200).json({
+        cloudName: CLOUDINARY_CLOUD_NAME,
+        apiKey:    CLOUDINARY_API_KEY,   // la api key no es secreta; el secret nunca sale del back
+        timestamp,
+        signature,
+        folder:          CLOUDINARY_FOLDER,
+        allowed_formats: CLOUDINARY_FORMATS,
+    });
+});
+
+// READ ALL (público) — solo productos activos
+// Antes devolvía también pausados y borrados: cualquiera veía lo que todavía no salió a la venta.
 productRouter.get("/api/products", async (req, res) => {
     try {
-        const products = await Product.find();
+        const products = await Product.find({ estado: "activo" });
         res.status(200).json({ message: "Products fetched successfully! 🟢", products });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET :`, error);
+        res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
+    }
+});
+
+// READ ALL (admin) — todos los estados, para el inventario
+productRouter.get("/api/admin/products", adminMiddleware, async (req, res) => {
+    try {
+        const products = await Product.find();
+        res.set("Cache-Control", "no-store");
+        res.status(200).json({ message: "Products fetched successfully! 🟢", products });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR en productRouter = GET admin:`, error);
         res.status(500).json({ message: "INTERNAL_SERVER_ERROR_READING_PRODUCTS! 🔴" });
     }
 });
@@ -238,7 +356,13 @@ productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) 
     try {
         const productos = await Product.find({}).lean();
         const BOM  = '\uFEFF';
-        const cell = (v) => `"${String(v ?? "").replace(/"/g, '""').replace(/\r?\n/g, " ")}"`;
+        // Una celda que empieza con = + - @ Excel la ejecuta como fórmula al abrir el archivo
+        // (CSV injection): se le antepone un apóstrofo para que quede como texto.
+        const cell = (v) => {
+            let s = String(v ?? "").replace(/\r?\n/g, " ");
+            if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+            return `"${s.replace(/"/g, '""')}"`;
+        };
 
         const headers = [
             "_id", "nombre", "marca", "sku_padre", "estado", "precio_base",
@@ -289,14 +413,14 @@ productRouter.get("/api/products/export-csv", adminMiddleware, async (req, res) 
     }
 });
 
-// READ INDIVIDUAL
+// READ INDIVIDUAL (público) — un producto pausado o borrado responde 404
 productRouter.get("/api/product/:id", async (req, res) => {
     const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isId(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
     try {
-        const product = await Product.findById(id);
+        const product = await Product.findOne({ _id: id, estado: "activo" });
         if (!product) return res.status(404).json({ message: "Product not found! 🔴" });
         res.status(200).json({ message: "Product found successfully! 🟢", product });
     } catch (error) {
@@ -308,7 +432,7 @@ productRouter.get("/api/product/:id", async (req, res) => {
 // UPDATE INDIVIDUAL — usa save() para que corran las validaciones del modelo
 productRouter.put("/api/product/update/:id", adminMiddleware, async (req, res) => {
     const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isId(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
 
@@ -334,7 +458,7 @@ productRouter.put("/api/product/update/:id", adminMiddleware, async (req, res) =
 productRouter.patch("/api/product/update-variant/:variantId", adminMiddleware, async (req, res) => {
     const { variantId } = req.params;
     const { formData = {} } = req.body;
-    if (!mongoose.Types.ObjectId.isValid(variantId)) return res.status(400).json({ message: "ID de variante inválido 🔴" });
+    if (!isId(variantId)) return res.status(400).json({ message: "ID de variante inválido 🔴" });
 
     const set = {};
     if (formData.stock !== undefined) {
@@ -374,16 +498,21 @@ productRouter.patch("/api/product/update-variant/:variantId", adminMiddleware, a
 
 // MASSIVE UPDATE — pipeline para que el stock nunca quede negativo y el precio redondee a céntimos
 productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
-    const { ids, cambios = {} } = req.body;
+    const { ids } = req.body ?? {};
+    const cambios = req.body?.cambios && typeof req.body.cambios === "object" ? req.body.cambios : {};
 
     if (!Array.isArray(ids) || ids.length === 0) {
         return res.status(400).json({ message: "Debes seleccionar al menos un producto para actualizar. 🔴" });
     }
-    const validIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+    if (ids.length > MAX_BULK_IDS) {
+        return res.status(400).json({ message: `Máximo ${MAX_BULK_IDS} productos por operación 🔴` });
+    }
+    const validIds = ids.filter(isId);
+    if (!validIds.length) return res.status(400).json({ message: "Ningún id válido 🔴" });
 
     const setFields = {};
     if (["activo", "pausado", "borrado"].includes(cambios.estado)) setFields.estado = cambios.estado;
-    if (typeof cambios.marca === "string" && cambios.marca.trim()) setFields.marca = cambios.marca.trim().toLowerCase();
+    if (typeof cambios.marca === "string" && cleanStr(cambios.marca, 80)) setFields.marca = cleanStr(cambios.marca, 80).toLowerCase();
     if (typeof cambios.en_promocion === "boolean") setFields.en_promocion = cambios.en_promocion;
     if (cambios.porcentaje_promo !== undefined) {
         const n = toNum(cambios.porcentaje_promo);
@@ -403,11 +532,17 @@ productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
 
     const pct = toNum(cambios.porcentaje_precio);
     if (Number.isFinite(pct) && pct !== 0) {
-        if (pct <= -100) return res.status(400).json({ message: "El ajuste de precio no puede ser de -100% o menos 🔴" });
+        // Con una sesión de admin robada, un -99 % dejaba toda la tienda casi gratis
+        if (pct < MAX_PRICE_DOWN || pct > MAX_PRICE_UP) {
+            return res.status(400).json({ message: `El ajuste de precio debe estar entre ${MAX_PRICE_DOWN}% y +${MAX_PRICE_UP}% 🔴` });
+        }
         pipeline.push({ $set: { precio_base: { $round: [{ $multiply: ["$precio_base", 1 + pct / 100] }, 2] } } });
     }
 
     const delta = toNum(cambios.stock_a_sumar);
+    if (Number.isInteger(delta) && Math.abs(delta) > MAX_STOCK_DELTA) {
+        return res.status(400).json({ message: `El ajuste de stock no puede superar ±${MAX_STOCK_DELTA} 🔴` });
+    }
     if (Number.isInteger(delta) && delta !== 0) {
         pipeline.push({
             $set: {
@@ -446,7 +581,7 @@ productRouter.patch("/api/bulk-update", adminMiddleware, async (req, res) => {
 // DELETE INDIVIDUAL
 productRouter.delete("/api/product/delete/:id", adminMiddleware, async (req, res) => {
     const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isId(id)) {
         return res.status(400).json({ message: "ObjectID format is invalid!. 🔴" });
     }
     try {
@@ -461,12 +596,17 @@ productRouter.delete("/api/product/delete/:id", adminMiddleware, async (req, res
 
 // MASSIVE DELETE
 productRouter.delete("/api/bulk-delete", adminMiddleware, async (req, res) => {
-    const { ids } = req.body;
+    const { ids } = req.body ?? {};
     if (!Array.isArray(ids) || ids.length === 0) {
         return res.status(400).json({ message: "Debes seleccionar al menos un producto para eliminar. 🔴" });
     }
+    if (ids.length > MAX_BULK_IDS) {
+        return res.status(400).json({ message: `Máximo ${MAX_BULK_IDS} productos por operación 🔴` });
+    }
+    const validIds = ids.filter(isId);
+    if (!validIds.length) return res.status(400).json({ message: "Ningún id válido 🔴" });
     try {
-        const result = await Product.deleteMany({ _id: { $in: ids.filter(id => mongoose.Types.ObjectId.isValid(id)) } });
+        const result = await Product.deleteMany({ _id: { $in: validIds } });
         res.status(200).json({ message: "Massive delete made successfully! 🟢", detalles: { total_seleccionados: ids.length, total_eliminados: result.deletedCount } });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] 🚨 ERROR en bulk-delete:`, error);
@@ -475,10 +615,21 @@ productRouter.delete("/api/bulk-delete", adminMiddleware, async (req, res) => {
 });
 
 // IMPORT CSV — admin primero, después se acepta el archivo
-productRouter.post("/api/products/bulk-import", adminMiddleware, upload.single('archivo'), async (req, res) => {
+// Los errores de multer (tipo o tamaño) se responden aquí con 400/413, no como 500 genérico
+const subirCsv = (req, res, next) => upload.single('archivo')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ message: "El CSV supera los 10 MB 🔴" });
+    if (err.code === "INVALID_TYPE")    return res.status(400).json({ message: "Solo se aceptan archivos .csv 🔴" });
+    return res.status(400).json({ message: "Archivo inválido 🔴" });
+});
+
+productRouter.post("/api/products/bulk-import", adminMiddleware, subirCsv, async (req, res) => {
     if (!req.file) return res.status(400).json({ message: "Archivo no encontrado" });
 
-    const borrarArchivo = () => { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); };
+    const borrarArchivo = () => {
+        try { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); }
+        catch (e) { console.error("[CSV] No se pudo borrar el temporal:", e.message); }
+    };
     const splitList = (s) => String(s || "").split("|").map(x => x.trim()).filter(Boolean);
 
     // Formato nuevo: "SKU ~ stock ~ extra ~ color: Azul / capacidad: 128GB"
@@ -501,9 +652,17 @@ productRouter.post("/api/products/bulk-import", adminMiddleware, upload.single('
     try {
         const filas = await new Promise((resolve, reject) => {
             const out = [];
-            fs.createReadStream(req.file.path)
+            const stream = fs.createReadStream(req.file.path);
+            stream
                 .pipe(csv({ separator: ';', mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-                .on('data', (d) => out.push(d))
+                .on('data', (d) => {
+                    out.push(d);
+                    // Tope de filas: cada una hace consultas a la BD
+                    if (out.length > MAX_CSV_ROWS) {
+                        stream.destroy();
+                        reject(Object.assign(new Error("Demasiadas filas"), { code: "TOO_MANY_ROWS" }));
+                    }
+                })
                 .on('end', () => resolve(out))
                 .on('error', reject);
         });
@@ -555,7 +714,11 @@ productRouter.post("/api/products/bulk-import", adminMiddleware, upload.single('
                 registrarAtributos(data.opciones);
                 procesados++;
             } catch (err) {
-                errores.push(`Fila ${i + 2} (${sku}): ${err.code === 11000 ? "SKU duplicado" : err.message}`);
+                const motivo = err.code === 11000 ? "SKU duplicado"
+                    : err.name === "ValidationError" ? (Object.values(err.errors)[0]?.message || "Datos inválidos")
+                    : "Error al guardar";
+                if (err.code !== 11000 && err.name !== "ValidationError") console.error(`[CSV] Fila ${i + 2}:`, err);
+                errores.push(`Fila ${i + 2} (${cleanStr(sku, 60)}): ${motivo}`);
             }
         }
 
@@ -566,17 +729,27 @@ productRouter.post("/api/products/bulk-import", adminMiddleware, upload.single('
         });
     } catch (error) {
         borrarArchivo();
+        if (error.code === "TOO_MANY_ROWS") {
+            return res.status(400).json({ message: `El CSV no puede tener más de ${MAX_CSV_ROWS} filas 🔴` });
+        }
         console.error(`[${new Date().toISOString()}] ERROR en IMPORT CSV = POST`, error);
-        res.status(500).json({ message: "Error en importación", error: error.message });
+        res.status(500).json({ message: "Error en importación 🔴" });   // sin detalles internos
     }
 });
 
 /* ════════════════════════════════════════════════════════════════════════════
    CATEGORÍAS
 ════════════════════════════════════════════════════════════════════════════ */
+// Letras (con tildes y ñ), números, espacios y guiones. De 2 a 50 caracteres.
+const CATEGORY_RE = /^[\p{L}\d][\p{L}\d &-]{1,49}$/u;
+
 productRouter.post("/api/categories", adminMiddleware, async (req, res) => {
+    // Solo string; en minúscula igual que en los productos (así el filtro y los cupones coinciden)
+    const nombre = cleanStr(req.body?.nombre, 50).toLowerCase();
+    if (!CATEGORY_RE.test(nombre)) {
+        return res.status(400).json({ message: "Nombre de categoría inválido (2 a 50 letras, números, espacios o guiones) 🔴" });
+    }
     try {
-        const { nombre } = req.body;
         const nuevaCategoria = new Category({ nombre });
         await nuevaCategoria.save();
         res.status(201).json(nuevaCategoria);
@@ -600,8 +773,10 @@ productRouter.get("/api/categories", async (req, res) => {
 });
 
 productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) => {
+    if (!isId(req.params.id)) return res.status(400).json({ message: "Categoría inválida 🔴" });
     try {
-        await Category.findByIdAndDelete(req.params.id);
+        const borrada = await Category.findByIdAndDelete(req.params.id);
+        if (!borrada) return res.status(404).json({ message: "Categoría no encontrada 🔴" });
         const categoriasActualizadas = await Category.find();
         res.status(200).json({ message: "Categoría eliminada", categoriasActualizadas });
     } catch (error) {
@@ -613,15 +788,28 @@ productRouter.delete("/api/categories/:id", adminMiddleware, async (req, res) =>
 /* ════════════════════════════════════════════════════════════════════════════
    FAVORITOS
 ════════════════════════════════════════════════════════════════════════════ */
+// Del cliente solo se toman productId e isFavorite. Nombre e imagen salen del producto en la BD:
+// antes se guardaba lo que mandara el cliente (un nombre falso o una URL cualquiera).
 productRouter.post('/api/product/toggle-fav', verifyToken, async (req, res) => {
-    const { nombre, productId, isFavorite, img } = req.body;
+    const { productId, isFavorite } = req.body ?? {};
     const userEmail = req.user?.email?.toLowerCase();
 
-    if (!userEmail || !productId) return res.status(400).json({ message: "Faltan datos requeridos" });
+    if (!userEmail) return res.status(401).json({ message: "No autenticado 🔴" });
+    if (!isId(productId) || typeof isFavorite !== "boolean") {
+        return res.status(400).json({ message: "Faltan datos requeridos" });
+    }
 
     try {
         if (isFavorite) {
-            const newFavorite = new Favorite({ nombre, userEmail, productId, img });
+            const product = await Product.findOne({ _id: productId, estado: "activo" }).select("nombre imagenes_generales").lean();
+            if (!product) return res.status(404).json({ message: "Producto no encontrado 🔴" });
+
+            const newFavorite = new Favorite({
+                nombre:    product.nombre,
+                userEmail,
+                productId: product._id,
+                img:       product.imagenes_generales?.[0] || "",
+            });
             await newFavorite.save();
             return res.status(201).json({ message: "Agregado a favoritos", active: true });
         } else {
@@ -640,7 +828,7 @@ productRouter.get('/api/product/fav/:email', verifyToken, async (req, res) => {
         return res.status(403).json({ message: "Sin permiso 🔴" });
     }
     try {
-        const favorites = await Favorite.find({ userEmail: req.params.email.toLowerCase() });
+        const favorites = await Favorite.find({ userEmail: req.user.email.toLowerCase() }).limit(500);
         res.status(200).json(favorites);
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR AL OBTENER FAVORITOS, GET`, error);
@@ -683,15 +871,25 @@ productRouter.get('/api/products/attribute-filters', async (req, res) => {
 
 productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, res) => {
     try {
-        const { nombre, marca, categoria, talle, attr, minPre, maxPre, promo, stock } = req.query;
+        // Solo strings y con largo máximo: un ?nombre=a&nombre=b (array) o un texto gigante
+        // no arman regex enormes ni consultas raras
+        const nombre    = qStr(req.query.nombre, 100);
+        const marca     = qStr(req.query.marca, 80);
+        const categoria = qStr(req.query.categoria, 50);
+        const talle     = qStr(req.query.talle, 60);
+        const attr      = qStr(req.query.attr, 300);
+        const minPre    = qStr(req.query.minPre, 20);
+        const maxPre    = qStr(req.query.maxPre, 20);
+        const promo     = qStr(req.query.promo, 5);
+        const stock     = qStr(req.query.stock, 5);
         const limit  = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-        const offset = Math.max(Number(req.query.offset) || 0, 0);
+        const offset = Math.min(Math.max(Number(req.query.offset) || 0, 0), 10000);
         const query  = { estado: 'activo' };
         const and    = [];
 
         // ── BÚSQUEDA POR TEXTO ──
         if (nombre && String(nombre).trim()) {
-            const terminos = String(nombre).trim().split(/\s+/).filter(Boolean).slice(0, 6);
+            const terminos = String(nombre).trim().split(/\s+/).filter(Boolean).slice(0, 6).map(t => t.slice(0, 30));
 
             terminos.forEach(termino => {
                 const t = escapeRegex(termino);
@@ -719,10 +917,11 @@ productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, r
         if (categoria) query.categorias = { $regex: new RegExp(`^${escapeRegex(categoria)}$`, 'i') };
         if (promo === 'true') query.en_promocion = true;
 
-        if (minPre || maxPre) {
+        const min = Number(minPre), max = Number(maxPre);
+        if ((minPre && Number.isFinite(min)) || (maxPre && Number.isFinite(max))) {
             query.precio_base = {};
-            if (minPre) query.precio_base.$gte = Number(minPre);
-            if (maxPre) query.precio_base.$lte = Number(maxPre);
+            if (minPre && Number.isFinite(min)) query.precio_base.$gte = min;
+            if (maxPre && Number.isFinite(max)) query.precio_base.$lte = max;
         }
 
         if (stock === 'true') {
@@ -733,7 +932,7 @@ productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, r
         const pares = [];
         if (talle) pares.push(["talle", String(talle)]);
         if (attr) {
-            String(attr).split(",").forEach(par => {
+            String(attr).split(",").slice(0, MAX_OPCIONES).forEach(par => {
                 const i = par.indexOf(":");
                 if (i > 0) pares.push([par.slice(0, i).trim().toLowerCase(), par.slice(i + 1).trim()]);
             });
@@ -768,24 +967,78 @@ productRouter.get(['/api/products/limit', '/api/products/filter'], async (req, r
 /* ════════════════════════════════════════════════════════════════════════════
    RESEÑAS
 ════════════════════════════════════════════════════════════════════════════ */
+// Antes: Reseñas.create(reviewData) con el body tal cual. Cualquiera con sesión podía publicar
+// reseñas a nombre de otro email, con rating 9999 o -50, y sin límite.
+// Ahora: email del token, lista blanca de campos, rating entero 1–5, una reseña por producto
+// y por usuario (índice único en el modelo) y máximo 5 por hora.
 productRouter.post("/api/product/rating", verifyToken, async (req, res) => {
-    const { reviewData } = req.body;
+    const userEmail = req.user?.email?.toLowerCase();
+    const uid       = req.user?.uid;
+    if (!userEmail || !uid) return res.status(401).json({ message: "No autenticado 🔴" });
+
+    const reviewData = req.body?.reviewData;
+    if (!reviewData || typeof reviewData !== "object") {
+        return res.status(400).json({ message: "All fields are required to create a product review! 🔴" });
+    }
+
+    const productId = reviewData.productId;
+    const rating    = Number(reviewData.rating);
+    const reseña    = typeof reviewData.reseña === "string"
+        ? reviewData.reseña.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").trim()
+        : "";
+
+    if (!isId(productId))                                return res.status(400).json({ message: "Producto inválido 🔴" });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ message: "El puntaje debe ser un entero de 1 a 5 🔴" });
+    if (reseña.length < 3 || reseña.length > 500)        return res.status(400).json({ message: "La reseña debe tener entre 3 y 500 caracteres 🔴" });
+
+    if (limiteResenas.bloqueado(uid)) {
+        return res.status(429).json({ message: "Demasiadas reseñas seguidas. Probá más tarde 🔴" });
+    }
+    limiteResenas.sumar(uid);
+
     try {
-        if (!reviewData) {
-            return res.status(400).json({ message: "All fields are required to create a product review! 🔴" });
-        }
-        const review = await Reseñas.create(reviewData);
-        res.status(201).json({ message: "Review created successfully! 🟢", review });
+        const existe = await Product.exists({ _id: productId, estado: "activo" });
+        if (!existe) return res.status(404).json({ message: "Producto no encontrado 🔴" });
+
+        const review = await Reseñas.create({ reseña, rating, userEmail, productId });
+        res.status(201).json({
+            message: "Review created successfully! 🟢",
+            review: {
+                _id:       review._id,
+                reseña:    review.reseña,
+                rating:    review.rating,
+                productId: review.productId,
+                userEmail: enmascararEmail(review.userEmail),
+                createdAt: review.createdAt,
+            },
+        });
     } catch (error) {
+        if (error?.code === 11000) {
+            return res.status(409).json({ message: "Ya dejaste una reseña para este producto 🔴" });
+        }
         console.error(`[${new Date().toISOString()}] ERROR AL CREAR REVIEW DE PRODUCTO`, error);
         res.status(500).json({ error: "INTERNAL_ERROR_PRODUCT REVIEW" });
     }
 });
 
+// Reseñas públicas: antes devolvía el email completo de cada cliente a cualquiera.
+// Ahora va enmascarado ("ma•••@gmail.com"), con ?productId= opcional y tope de 500.
 productRouter.get("/api/product-reviews", async (req, res) => {
+    const filtro = {};
+    if (req.query.productId !== undefined) {
+        if (!isId(req.query.productId)) return res.status(400).json({ message: "Producto inválido 🔴" });
+        filtro.productId = req.query.productId;
+    }
     try {
-        const reviews = await Reseñas.find();
-        res.status(200).json({ message: "Reviews downloaded successfully! 🟢", reviews });
+        const reviews = await Reseñas.find(filtro)
+            .sort({ createdAt: -1 })
+            .limit(500)
+            .select("reseña rating productId userEmail createdAt")
+            .lean();
+        res.status(200).json({
+            message: "Reviews downloaded successfully! 🟢",
+            reviews: reviews.map(r => ({ ...r, userEmail: enmascararEmail(r.userEmail) })),
+        });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR TRAER REVIEWS DE PRODUCTO`, error);
         res.status(500).json({ error: "INTERNAL ERROR TRAER REVIEWs DE PRODUCTO" });

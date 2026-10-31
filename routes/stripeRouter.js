@@ -24,12 +24,12 @@
      invitado consulta el estado y reutiliza el pedido si reintenta.
    · Nunca se toca el carrito en BD de una cuenta con ese mismo email.
 
-   ADMIN
-   GET  /api/admin/orders                  listado (filtros status / needsReview)
-   POST /api/admin/orders/:id/refund       reembolso total o parcial (+ reponer stock / liberar cupón)
-   POST /api/admin/orders/:id/reconcile    re-sincroniza con Stripe (si el webhook no llegó)
-   POST /api/admin/orders/:id/cancel       cancela un pedido pendiente
-   PATCH /api/admin/orders/:id/review      marca una revisión como resuelta
+   ADMIN  (todas las acciones piden la clave de firma: { pin } en el body)
+   GET  /api/admin/orders                  listado (filtros status / needsReview) — solo lectura, sin pin
+   POST /api/admin/orders/:id/refund       reembolso total o parcial (+ reponer stock / liberar cupón)  🔑
+   POST /api/admin/orders/:id/reconcile    re-sincroniza con Stripe (si el webhook no llegó)            🔑
+   POST /api/admin/orders/:id/cancel       cancela un pedido pendiente                                  🔑
+   PATCH /api/admin/orders/:id/review      marca una revisión como resuelta                             🔑
 
    CLIENTE
    GET  /api/orders/mine                   sus pedidos (reemplaza a /tickets)
@@ -52,6 +52,8 @@ const Product         = require("../models/productModel");
 const Cart            = require("../models/CartSchema");
 const verifyToken     = require("../middleware/authMiddleware");
 const adminMiddleware = require("../middleware/adminMiddleware");
+const { getClientIp }  = adminMiddleware;
+const requireSignPin  = require("../middleware/requireSignPin");
 const { notifyNewSale } = require("../sseManager/sseManajer");
 
 const stripeRouter = express.Router();
@@ -71,12 +73,15 @@ const MAX_LINES            = 50;
 const REUSABLE_PI_STATUSES = ["requires_payment_method", "requires_confirmation"];
 const PAID_STATUSES        = ["approved", "partially_refunded", "refunded", "disputed"];
 const OPEN_STATUSES        = ["pending", "in_process", "rejected"];
+const ADMIN_STATUSES       = [...PAID_STATUSES, ...OPEN_STATUSES, "canceled", "review"];
 
 const STORE_NAME  = process.env.STORE_NAME || "Dekin Hogar";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_FROM;
 
-// cookie(s) de sesión que lee authMiddleware (separadas por coma en el .env)
-const SESSION_COOKIES = (process.env.SESSION_COOKIE_NAMES || "token")
+// cookie(s) de sesión que lee authMiddleware (separadas por coma en el .env).
+// La sesión del proyecto va en la cookie "idToken": si no se reconoce, un
+// usuario logueado entraría como invitado (sin cupones y con pedido de invitado).
+const SESSION_COOKIES = (process.env.SESSION_COOKIE_NAMES || "idToken")
     .split(",").map(s => s.trim()).filter(Boolean);
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -99,6 +104,44 @@ const cleanEmail = (v) => {
 const newStatusToken = () => crypto.randomBytes(24).toString("hex");
 const hashToken      = (t) => crypto.createHash("sha256").update(String(t)).digest("hex");
 
+// ════════════════════════════════════════════════════════════════════════════
+//  LÍMITES (en memoria, mismo patrón que el resto de routers)
+//  · crear pago: cada llamada crea un pedido y un PaymentIntent → spam y
+//    "card testing" (probar tarjetas robadas contra tu cuenta de Stripe)
+//  · cotizar / consultar estado: consultas a Mongo y a la API de Stripe
+//  · fallos de cupón: evita adivinar códigos probando en /stripe-quote
+// ════════════════════════════════════════════════════════════════════════════
+function crearLimite(max, ventanaMs) {
+    const mapa = new Map();
+    return {
+        bloqueado(k) {
+            const r = mapa.get(k);
+            if (!r) return false;
+            if (Date.now() - r.first > ventanaMs) { mapa.delete(k); return false; }
+            return r.count >= max;
+        },
+        sumar(k) {
+            const now = Date.now();
+            const r = mapa.get(k);
+            if (!r || now - r.first > ventanaMs) mapa.set(k, { count: 1, first: now });
+            else r.count += 1;
+            if (mapa.size > 5000) for (const [kk, v] of mapa) if (now - v.first > ventanaMs) mapa.delete(kk);
+        },
+    };
+}
+
+const limitePagoIp     = crearLimite(15, 15 * 60 * 1000);    // 15 intentos de pago / 15 min por IP
+const limitePagoCuenta = crearLimite(10, 15 * 60 * 1000);    // 10 / 15 min por cuenta o email invitado
+const limiteCotizar    = crearLimite(120, 10 * 60 * 1000);   // el checkout recotiza al cambiar envío / cupón
+const limiteEstado     = crearLimite(120, 5 * 60 * 1000);    // el polling hace 12 consultas por pago
+const fallosCupon      = crearLimite(8, 15 * 60 * 1000);     // mismo criterio que cartRouter
+
+const demasiados = (res, msg = "Demasiadas solicitudes. Espera unos minutos e inténtalo de nuevo 🔴") =>
+    res.status(429).json({ message: msg, code: "RATE_LIMIT" });
+
+const claveCuenta = (req) => (req.user?.uid ? `uid:${req.user.uid}` : null);
+const COUPON_LOCKED_MSG = "Demasiados intentos con cupones. Prueba más tarde 🔴";
+
 class CheckoutError extends Error {
     constructor(status, message, code = "CHECKOUT") {
         super(message);
@@ -118,6 +161,13 @@ function unitPriceCents(product, variante = null) {
         listCents,
         unitCents: Math.round(listCents * (1 - promo / 100)),
     };
+}
+
+// el hash del statusToken del invitado no sale nunca en una respuesta
+function sinSecretos(order) {
+    const o = typeof order?.toObject === "function" ? order.toObject() : { ...(order || {}) };
+    delete o.statusTokenHash;
+    return o;
 }
 
 function pushHistory(order, status, note) {
@@ -795,10 +845,19 @@ async function webhookHandler(req, res) {
 //  Con o sin sesión. Sin sesión no se aceptan cupones.
 // ════════════════════════════════════════════════════════════════════════════
 stripeRouter.post("/stripe-quote", optionalAuth, async (req, res) => {
+    const ip = getClientIp(req);
+    if (limiteCotizar.bloqueado(ip)) return demasiados(res);
+    limiteCotizar.sumar(ip);
+
     const email = req.user?.email?.toLowerCase() || null;
     const guest = !email;
+    const cuenta = claveCuenta(req);
 
     const { items, couponCode, shipping } = req.body || {};
+    const traeCupon = typeof couponCode === "string" && couponCode.trim() !== "";
+    if (traeCupon && cuenta && fallosCupon.bloqueado(cuenta)) {
+        return res.status(429).json({ message: COUPON_LOCKED_MSG, code: "COUPON_LOCKED" });
+    }
     try {
         const quote = await buildQuote({
             items: cartItemsToQuoteItems(items),
@@ -810,6 +869,7 @@ stripeRouter.post("/stripe-quote", optionalAuth, async (req, res) => {
         res.status(200).json({ quote: publicQuote(quote) });
     } catch (error) {
         if (error instanceof CheckoutError) {
+            if (error.code === "COUPON" && cuenta) fallosCupon.sumar(cuenta);
             return res.status(error.status).json({ message: `${error.message} 🔴`, code: error.code });
         }
         console.error(`[${new Date().toISOString()}] ERROR COTIZANDO:`, error);
@@ -910,6 +970,20 @@ stripeRouter.post("/stripe-create-payment-intent", optionalAuth, async (req, res
     const email        = sessionEmail || cleanEmail(req.body?.email);
     if (!email) {
         return res.status(400).json({ message: "Introduce un email válido: ahí te llegan la confirmación y la factura 🔴", code: "EMAIL" });
+    }
+
+    // cada llamada puede crear un pedido + PaymentIntent: se limita por IP y por cuenta / email
+    const ip     = getClientIp(req);
+    const cuenta = claveCuenta(req) || `guest:${email}`;
+    if (limitePagoIp.bloqueado(ip) || limitePagoCuenta.bloqueado(cuenta)) {
+        return demasiados(res, "Demasiados intentos de pago. Espera unos minutos antes de volver a intentarlo 🔴");
+    }
+    limitePagoIp.sumar(ip);
+    limitePagoCuenta.sumar(cuenta);
+
+    const traeCupon = typeof couponCode === "string" && couponCode.trim() !== "";
+    if (traeCupon && !guest && fallosCupon.bloqueado(cuenta)) {
+        return res.status(429).json({ message: COUPON_LOCKED_MSG, code: "COUPON_LOCKED" });
     }
 
     try {
@@ -1025,6 +1099,7 @@ stripeRouter.post("/stripe-create-payment-intent", optionalAuth, async (req, res
 
     } catch (error) {
         if (error instanceof CheckoutError) {
+            if (error.code === "COUPON" && !guest) fallosCupon.sumar(cuenta);
             return res.status(error.status).json({ message: `${error.message} 🔴`, code: error.code });
         }
         console.error(`[${new Date().toISOString()}] ERROR CREANDO PAYMENT INTENT:`, error);
@@ -1043,6 +1118,12 @@ stripeRouter.get("/stripe-order-status/:orderId", optionalAuth, async (req, res)
     const { orderId } = req.params;
     if (!isId(orderId)) return res.status(400).json({ message: "Pedido inválido 🔴" });
     if (!email && !token) return res.status(401).json({ message: "No autorizado 🔴" });
+    if (token && token.length > 100) return res.status(400).json({ message: "Pedido inválido 🔴" });
+
+    // cada consulta puede pegarle a la API de Stripe: se limita por IP
+    const ip = getClientIp(req);
+    if (limiteEstado.bloqueado(ip)) return demasiados(res);
+    limiteEstado.sumar(ip);
 
     try {
         let order = null;
@@ -1109,16 +1190,19 @@ stripeRouter.get("/api/orders/mine", verifyToken, async (req, res) => {
 stripeRouter.get("/api/admin/orders", adminMiddleware, async (req, res) => {
     try {
         const { status, needsReview } = req.query;
-        const limit = Math.min(Number(req.query.limit) || 50, 200);
-        const page  = Math.max(Number(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+        const page  = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), 10000);
 
         const query = {};
-        if (status) query.status = { $in: String(status).split(",") };
+        const estados = typeof status === "string"
+            ? status.split(",").map(s => s.trim()).filter(s => ADMIN_STATUSES.includes(s))
+            : [];
+        if (estados.length) query.status = { $in: estados };
         else        query.status = { $ne: "pending" };
         if (needsReview === "true") query.needsReview = true;
 
         const [orders, total] = await Promise.all([
-            PaymentsMongo.find(query).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+            PaymentsMongo.find(query).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).select("-statusTokenHash").lean(),
             PaymentsMongo.countDocuments(query),
         ]);
         res.status(200).json({ orders, total, page });
@@ -1130,7 +1214,7 @@ stripeRouter.get("/api/admin/orders", adminMiddleware, async (req, res) => {
 
 // Body: { amount?: euros (vacío = todo lo que queda), reason?, note?,
 //         restock?: true | [{ index, cantidad }], releaseCoupon?: boolean }
-stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, async (req, res) => {
+stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, requireSignPin, async (req, res) => {
     const { id } = req.params;
     if (!isId(id)) return res.status(400).json({ message: "Pedido inválido 🔴" });
 
@@ -1139,12 +1223,17 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, async (req, r
     try {
         const order = await PaymentsMongo.findById(id);
         if (!order) return res.status(404).json({ message: "Pedido no encontrado 🔴" });
-        if (!["approved", "partially_refunded"].includes(order.status)) {
+        // "review" = cobrado pero con importe a revisar: también se puede devolver
+        const esRevision = order.status === "review" && order.amountReceivedCents > 0;
+        if (!["approved", "partially_refunded"].includes(order.status) && !esRevision) {
             return res.status(409).json({ message: `No se puede reembolsar un pedido en estado "${order.status}" 🔴` });
         }
+        if (!order.stripePaymentIntentId) return res.status(400).json({ message: "El pedido no tiene pago en Stripe 🔴" });
 
         await syncRefunds(order);                     // estado real antes de calcular
-        const restante = order.totalCents - order.refundedCents;
+        // el tope es lo que Stripe cobró de verdad (no lo que decía el pedido)
+        const cobrado  = order.amountReceivedCents || order.totalCents;
+        const restante = cobrado - order.refundedCents;
         const amountCents = amount === undefined || amount === null || amount === "" ? restante : toCents(amount);
 
         if (!Number.isInteger(amountCents) || amountCents <= 0) return res.status(400).json({ message: "Importe de reembolso inválido 🔴" });
@@ -1174,13 +1263,13 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, async (req, r
 
         // reponer stock
         let repuestos = [];
-        if (restock && order.stockApplied) {
+        if ((restock === true || Array.isArray(restock)) && order.stockApplied) {
             repuestos = await restockItems(order, Array.isArray(restock) ? restock : null);
             entry.restocked = repuestos.length > 0;
         }
 
         // liberar el uso del cupón (solo si es reembolso total)
-        if (liberarCupon && order.status === "refunded" && order.couponBurned && !order.couponReleased && order.coupon?.couponId) {
+        if (liberarCupon === true && order.status === "refunded" && order.couponBurned && !order.couponReleased && order.coupon?.couponId) {
             order.couponReleased = await releaseCoupon(order.coupon.couponId, order.email);
             entry.couponReleased = order.couponReleased;
         }
@@ -1191,7 +1280,7 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, async (req, r
         await sendMail(order.email, `Reembolso de tu pedido ${order.orderId}`,
             mailLayout("Reembolso en camino", `${p(`Hemos solicitado un reembolso de <strong style="color:#fff;">${formatEUR(amountCents)}</strong> a tu método de pago. Según tu banco puede tardar entre 5 y 10 días hábiles en verse reflejado.`)}${p(`Pedido ${escapeHtml(order.orderId)}`)}`));
 
-        res.status(200).json({ message: `Reembolso de ${formatEUR(amountCents)} solicitado 🟢`, refund: { id: refund.id, status: refund.status }, order });
+        res.status(200).json({ message: `Reembolso de ${formatEUR(amountCents)} solicitado 🟢`, refund: { id: refund.id, status: refund.status }, order: sinSecretos(order) });
 
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR REEMBOLSO:`, error);
@@ -1199,7 +1288,7 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, async (req, r
     }
 });
 
-stripeRouter.post("/api/admin/orders/:id/reconcile", adminMiddleware, async (req, res) => {
+stripeRouter.post("/api/admin/orders/:id/reconcile", adminMiddleware, requireSignPin, async (req, res) => {
     const { id } = req.params;
     if (!isId(id)) return res.status(400).json({ message: "Pedido inválido 🔴" });
 
@@ -1223,14 +1312,14 @@ stripeRouter.post("/api/admin/orders/:id/reconcile", adminMiddleware, async (req
                 await order.save();
             }
         }
-        res.status(200).json({ message: `Sincronizado con Stripe (${pi.status}) 🟢`, order });
+        res.status(200).json({ message: `Sincronizado con Stripe (${pi.status}) 🟢`, order: sinSecretos(order) });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR RECONCILE:`, error);
         res.status(500).json({ message: "Error al sincronizar con Stripe 🔴" });
     }
 });
 
-stripeRouter.post("/api/admin/orders/:id/cancel", adminMiddleware, async (req, res) => {
+stripeRouter.post("/api/admin/orders/:id/cancel", adminMiddleware, requireSignPin, async (req, res) => {
     const { id } = req.params;
     if (!isId(id)) return res.status(400).json({ message: "Pedido inválido 🔴" });
 
@@ -1249,14 +1338,14 @@ stripeRouter.post("/api/admin/orders/:id/cancel", adminMiddleware, async (req, r
         order.status = "canceled";
         pushHistory(order, "canceled", `Cancelado por ${req.user?.email || "admin"}`);
         await order.save();
-        res.status(200).json({ message: "Pedido cancelado 🟢", order });
+        res.status(200).json({ message: "Pedido cancelado 🟢", order: sinSecretos(order) });
     } catch (error) {
         console.error(`[${new Date().toISOString()}] ERROR CANCEL ORDER:`, error);
         res.status(500).json({ message: "Error al cancelar el pedido 🔴" });
     }
 });
 
-stripeRouter.patch("/api/admin/orders/:id/review", adminMiddleware, async (req, res) => {
+stripeRouter.patch("/api/admin/orders/:id/review", adminMiddleware, requireSignPin, async (req, res) => {
     const { id } = req.params;
     if (!isId(id)) return res.status(400).json({ message: "Pedido inválido 🔴" });
 
@@ -1266,8 +1355,9 @@ stripeRouter.patch("/api/admin/orders/:id/review", adminMiddleware, async (req, 
         order.needsReview = false;
         pushHistory(order, order.status, `Revisión resuelta por ${req.user?.email || "admin"}${req.body?.note ? `: ${cleanStr(req.body.note, 300)}` : ""}`);
         await order.save();
-        res.status(200).json({ message: "Revisión marcada como resuelta 🟢", order });
+        res.status(200).json({ message: "Revisión marcada como resuelta 🟢", order: sinSecretos(order) });
     } catch (error) {
+        console.error(`[${new Date().toISOString()}] ERROR REVIEW ORDER:`, error);
         res.status(500).json({ message: "Error al actualizar la revisión 🔴" });
     }
 });
