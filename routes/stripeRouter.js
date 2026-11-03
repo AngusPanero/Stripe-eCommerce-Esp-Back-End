@@ -38,7 +38,6 @@
 const express    = require("express");
 const mongoose   = require("mongoose");
 const crypto     = require("crypto");
-const nodemailer = require("nodemailer");
 const Stripe     = require("stripe");
 
 if (!process.env.STRIPE_SECRET_KEY) {
@@ -55,6 +54,7 @@ const adminMiddleware = require("../middleware/adminMiddleware");
 const { getClientIp }  = adminMiddleware;
 const requireSignPin  = require("../middleware/requireSignPin");
 const { notifyNewSale } = require("../sseManager/sseManajer");
+const { mail }          = require("./contactRouter");   // transporte y diseño compartidos de los mails
 
 const stripeRouter = express.Router();
 
@@ -76,7 +76,7 @@ const OPEN_STATUSES        = ["pending", "in_process", "rejected"];
 const ADMIN_STATUSES       = [...PAID_STATUSES, ...OPEN_STATUSES, "canceled", "review"];
 
 const STORE_NAME  = process.env.STORE_NAME || "Dekin Hogar";
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || process.env.EMAIL_FROM;
+const ADMIN_EMAIL = mail.destinoAdmin;   // ADMIN_EMAIL → EMAIL_TO → EMAIL_FROM
 
 // cookie(s) de sesión que lee authMiddleware (separadas por coma en el .env).
 // La sesión del proyecto va en la cookie "idToken": si no se reconoce, un
@@ -444,73 +444,90 @@ function cartItemsToQuoteItems(arr = []) {
 
 // ════════════════════════════════════════════════════════════════════════════
 //  MAILS (aviso al dueño + confirmaciones al cliente)
+//  El transporte y la plantilla están en contactRouter (`mail`): todos los
+//  correos de la tienda comparten diseño. Aquí solo se arma el contenido.
 // ════════════════════════════════════════════════════════════════════════════
-const mailer = process.env.EMAIL_FROM && process.env.PASS_EMAIL
-    ? nodemailer.createTransport({ service: "gmail", auth: { user: process.env.EMAIL_FROM, pass: process.env.PASS_EMAIL } })
-    : null;
+const escapeHtml = mail.esc;
+const STRIPE_TEST = String(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_test");
+const stripeLink = (piId) =>
+    /^pi_[A-Za-z0-9]+$/.test(String(piId || "")) ? `https://dashboard.stripe.com/${STRIPE_TEST ? "test/" : ""}payments/${piId}` : null;
+const stripeCta = (piId, label = "Ver el pago en Stripe") => {
+    const href = stripeLink(piId);
+    return href ? { label, href } : null;
+};
+const primerNombre = (o) => String(o?.billing?.nombre || o?.nombre || "").trim().split(/\s+/)[0] || "";
 
-const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const p = (txt) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:rgba(240,235,229,.8);">${txt}</p>`;
-const alertBox = (txt) => `<p style="margin:0 0 16px;padding:12px 14px;background:rgba(232,75,26,.12);border-left:3px solid #E84B1A;font-size:14px;color:#F0EBE5;">${txt}</p>`;
-
+// Los fallos de mail nunca frenan un cobro ni un webhook: se registran y listo
 async function sendMail(to, subject, html) {
-    if (!mailer || !to) return;
+    if (!mail.configurado || !to) return;
     try {
-        await mailer.sendMail({ from: `"${STORE_NAME}" <${process.env.EMAIL_FROM}>`, to, subject, html });
+        await mail.enviar({ to, subject, html });
     } catch (err) {
         console.error(`[MAIL] Error enviando "${subject}" a ${to}:`, err.message);
     }
 }
 
-function mailLayout(titulo, contenido) {
-    return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"/></head>
-<body style="margin:0;padding:32px 12px;background:#F2EDE8;font-family:Arial,Helvetica,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#1A1614;">
-  <tr><td style="background:#E84B1A;padding:22px 32px;font-size:22px;font-weight:800;letter-spacing:.08em;color:#fff;text-transform:uppercase;">${escapeHtml(STORE_NAME)}</td></tr>
-  <tr><td style="padding:32px;color:#F0EBE5;">
-    <p style="margin:0 0 18px;font-size:20px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#F0EBE5;">${escapeHtml(titulo)}</p>
-    ${contenido}
-  </td></tr>
-  <tr><td style="padding:16px 32px;background:#F2EDE8;font-size:11px;color:rgba(26,22,20,.45);">Mensaje automático · ${escapeHtml(STORE_NAME)}</td></tr>
-</table></td></tr></table></body></html>`;
+const itemsCount = (o) => (o.items || []).reduce((a, i) => a + (Number(i.cantidad) || 0), 0);
+
+// Productos + totales del pedido
+function resumenPedido(order, label = "Pedido") {
+    const items = mail.itemsTable((order.items || []).map(i => ({
+        nombre:     capitalize(i.nombre),
+        detalle:    i.varianteLabel || "",
+        cantidad:   i.cantidad,
+        totalCents: (i.lineCents || 0) - (i.discountCents || 0),
+        imagen:     i.imagen,
+    })));
+    const pickup = order.shipping?.mode === "pickup";
+    const tot = mail.totals([
+        ["Subtotal", order.subtotalCents],
+        order.discountCents ? [`Cupón ${order.coupon?.code || ""}`.trim(), -order.discountCents, { color: "#E84B1A" }] : null,
+        pickup ? ["Recogida en tienda", 0, { text: "Sin coste" }]
+               : ["Envío", order.shippingCents, order.shippingCents ? {} : { text: "Gratis" }],
+        ["Total", order.totalCents, { strong: true }],
+    ]);
+    return mail.section(label, items + tot);
 }
 
-function orderSummaryHtml(order) {
-    const td  = "padding:8px 0;border-bottom:1px solid rgba(255,255,255,.08);font-size:14px;color:#F0EBE5;";
-    const rows = order.items.map(i => `<tr>
-        <td style="${td}">${escapeHtml(capitalize(i.nombre))} × ${i.cantidad}${i.varianteLabel ? `<br><span style="font-size:12px;color:rgba(240,235,229,.55);">${escapeHtml(i.varianteLabel)}</span>` : ""}</td>
-        <td style="${td}text-align:right;">${formatEUR(i.lineCents - (i.discountCents || 0))}</td></tr>`).join("");
-    const line = (label, cents, strong = false) => `<tr>
-        <td style="padding:6px 0;font-size:13px;color:rgba(240,235,229,.6);">${label}</td>
-        <td style="padding:6px 0;text-align:right;font-size:${strong ? 17 : 13}px;color:#F0EBE5;${strong ? "font-weight:800;" : ""}">${formatEUR(cents)}</td></tr>`;
-
-    return `${p(`Pedido <strong style="color:#fff;">${escapeHtml(order.orderId)}</strong>`)}
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-      ${rows}
-      ${line("Subtotal", order.subtotalCents)}
-      ${order.discountCents ? line(`Cupón ${escapeHtml(order.coupon?.code || "")}`, -order.discountCents) : ""}
-      ${line(order.shipping?.mode === "pickup" ? "Recogida en tienda" : "Envío", order.shippingCents)}
-      ${line("Total", order.totalCents, true)}
-    </table>`;
-}
-
-function facturaHtml(o) {
-    const b = o.billing || {};
-    const doc = b.documento || b.cif;
-    if (!doc) return "";
-    const d = b.direccion || {};
-    const dir = [
+function direccionTexto(d = {}) {
+    return [
         [d.calle, d.numero, d.piso].filter(Boolean).join(" "),
         [d.codigoPostal, d.ciudad].filter(Boolean).join(" "),
         d.provincia,
         d.pais,
     ].filter(Boolean).join(", ");
-    const tipoDoc = b.tipoDocumento === "vat_ue" ? "NIF-IVA" : (b.tipoDocumento || "NIF").toUpperCase();
-    return p(`Datos de facturación: <strong style="color:#fff;">${escapeHtml(titularFactura(b))}</strong> · ${escapeHtml(tipoDoc)} ${escapeHtml(doc)}${dir ? `<br><span style="font-size:13px;color:rgba(240,235,229,.6);">${escapeHtml(dir)}</span>` : ""}`);
 }
 
-const clienteHtml = (o) => p(`Cliente: <strong style="color:#fff;">${escapeHtml(o.nombre || "-")}</strong> · ${escapeHtml(o.email)} · ${escapeHtml(o.telefono || "-")}${o.guest ? " · <strong style=\"color:#E84B1A;\">SIN CUENTA</strong>" : ""}`);
+function datosEntrega(o, label = "Entrega") {
+    if (o.shipping?.mode === "pickup") {
+        return mail.section(label, mail.rows([["Modalidad", "Recogida en tienda"], ["Coordinación", "Te escribimos por email"]]));
+    }
+    const dir = direccionTexto(o.shipping?.address);
+    return dir ? mail.section(label, mail.rows([["Modalidad", "Envío a domicilio"], ["Dirección", dir]])) : "";
+}
+
+function datosFactura(o, label = "Facturación") {
+    const b = o.billing || {};
+    const doc = b.documento || b.cif;
+    if (!doc) return "";
+    const tipoDoc = b.tipoDocumento === "vat_ue" ? "NIF-IVA" : (b.tipoDocumento || "NIF").toUpperCase();
+    return mail.section(label, mail.rows([
+        [b.type === "empresa" ? "Razón social" : "Titular", titularFactura(b) || "—"],
+        [tipoDoc, doc, { mono: true }],
+        ["Dirección fiscal", direccionTexto(b.direccion) || "—"],
+    ]));
+}
+
+function datosCliente(o) {
+    return mail.section("Cliente", mail.rows([
+        ["Nombre", o.nombre || "—"],
+        ["Email", `<a href="mailto:${escapeHtml(o.email)}" style="color:#1A1614;text-decoration:underline;">${escapeHtml(o.email)}</a>`, { raw: true }],
+        ["Teléfono", o.telefono || "—"],
+        ["Cuenta", o.guest ? "Compra sin cuenta" : "Cliente registrado"],
+    ]));
+}
+
+const notasRevision = (o) => (o.reviewNotes || []).map(n => mail.note(escapeHtml(n), "warn")).join("");
 
 // ════════════════════════════════════════════════════════════════════════════
 //  FULFILLMENT — idempotente: Stripe puede mandar el mismo evento varias veces
@@ -593,13 +610,15 @@ async function fulfillOrder(orderId, pi) {
                 }
             }
 
-            // 4. estado
-            if (!PAID_STATUSES.includes(order.status)) {
-                justPaid           = true;
-                order.status       = "approved";
-                order.paidAt       = new Date();
+            // 4. estado — paidAt marca "ya cobrado y avisado". No se usa el estado porque
+            //    un contracargo puede llegar antes que este evento y dejarlo en "disputed":
+            //    así igual se avisa la venta, una sola vez.
+            if (!order.paidAt) {
+                justPaid             = true;
+                order.paidAt         = new Date();
                 order.failureMessage = null;
-                pushHistory(order, "approved", `Pago confirmado por Stripe (${pi.id})`);
+                if (!PAID_STATUSES.includes(order.status)) order.status = "approved";
+                pushHistory(order, order.status, `Pago confirmado por Stripe (${pi.id})`);
             }
 
             await order.save({ session });
@@ -623,17 +642,40 @@ async function afterPaid(order) {
     try { notifyNewSale(order); }
     catch (err) { console.error("[STRIPE] Error SSE:", err.message); }
 
-    const alertas = (order.reviewNotes || []).map(n => alertBox(`⚠️ ${escapeHtml(n)}`)).join("");
+    const pickup = order.shipping?.mode === "pickup";
+    const n      = itemsCount(order);
+    const nombre = primerNombre(order);
 
     await sendMail(
         ADMIN_EMAIL,
         `🟢 Nueva venta ${order.orderId} — ${formatEUR(order.totalCents)}${order.guest ? " (sin cuenta)" : ""}${order.needsReview ? " (REVISAR)" : ""}`,
-        mailLayout("Nueva venta aprobada", `${alertas}${clienteHtml(order)}${facturaHtml(order)}${orderSummaryHtml(order)}`)
+        mail.layout({
+            audience:  "admin",
+            preheader: `${formatEUR(order.totalCents)} · ${n} artículo${n === 1 ? "" : "s"} · ${order.nombre || order.email}`,
+            eyebrow:   order.needsReview ? "Venta a revisar" : "Venta confirmada",
+            tone:      order.needsReview ? "warn" : "ok",
+            title:     "Nueva venta",
+            accent:    formatEUR(order.totalCents),
+            intro:     `Stripe confirmó el pago${order.guest ? " de un cliente sin cuenta" : ""}. ${pickup ? "El cliente pasará a recogerlo por la tienda." : "Prepara el envío a la dirección de abajo."}`,
+            ref:       order.orderId,
+            body:      `${notasRevision(order)}${datosCliente(order)}${datosEntrega(order)}${datosFactura(order)}${resumenPedido(order)}`,
+            cta:       stripeCta(order.stripePaymentIntentId),
+        })
     );
     await sendMail(
         order.email,
-        `Confirmación de tu pedido ${order.orderId}`,
-        mailLayout("¡Gracias por tu compra!", `${p("Hemos recibido tu pago correctamente. Te avisaremos cuando tu pedido esté en camino. La factura se emitirá con estos datos.")}${facturaHtml(order)}${orderSummaryHtml(order)}`)
+        `Pedido ${order.orderId} confirmado — ${STORE_NAME}`,
+        mail.layout({
+            preheader: `Pedido ${order.orderId} · ${formatEUR(order.totalCents)}. ${pickup ? "Te escribimos para coordinar la recogida." : "Te avisamos en cuanto salga."}`,
+            eyebrow:   "Pago confirmado",
+            tone:      "ok",
+            title:     nombre ? "Gracias," : "Gracias por",
+            accent:    nombre ? `${nombre}.` : "tu compra.",
+            intro:     `Hemos recibido tu pago y ya estamos preparando tu pedido. ${pickup ? "Te escribiremos para coordinar el día y la hora de la recogida." : "Te avisaremos en cuanto salga hacia ti."}`,
+            ref:       order.orderId,
+            body:      `${resumenPedido(order, "Tu pedido")}${datosEntrega(order)}${datosFactura(order)}${mail.para("¿Algo no está bien? Responde a este correo y lo revisamos contigo.")}`,
+            cta:       mail.siteUrl ? { label: "Seguir comprando", href: mail.siteUrl } : null,
+        })
     );
 }
 
@@ -718,7 +760,21 @@ async function handleStripeEvent(event) {
             if (!order) {
                 console.error(`[STRIPE] Pago ${obj.id} sin pedido asociado`);
                 await sendMail(ADMIN_EMAIL, `🔴 Pago sin pedido asociado (${obj.id})`,
-                    mailLayout("Pago sin pedido", p(`Stripe confirmó un pago de ${formatEUR(obj.amount_received)} (${escapeHtml(obj.receipt_email || "")}) que no corresponde a ningún pedido. Revisalo en el panel de Stripe.`)));
+                    mail.layout({
+                        audience:  "admin",
+                        preheader: `Stripe cobró ${formatEUR(obj.amount_received)} sin un pedido en la tienda.`,
+                        eyebrow:   "Revisión necesaria",
+                        title:     "Pago sin",
+                        accent:    "pedido",
+                        intro:     "Stripe confirmó un cobro que no corresponde a ningún pedido de la tienda. Puede ser un pago de prueba o uno creado a mano desde Stripe. Si no lo reconoces, revísalo y reembólsalo desde ahí.",
+                        ref:       obj.id,
+                        body:      mail.section("Pago", mail.rows([
+                            ["Importe", formatEUR(obj.amount_received)],
+                            ["Email del pago", obj.receipt_email || "—"],
+                            ["PaymentIntent", obj.id, { mono: true }],
+                        ])),
+                        cta:       stripeCta(obj.id),
+                    }));
                 return;
             }
             await fulfillOrder(order._id, obj);
@@ -732,7 +788,18 @@ async function handleStripeEvent(event) {
             pushHistory(order, "in_process", "Stripe está procesando el pago");
             await order.save();
             await sendMail(ADMIN_EMAIL, `🟡 Pago pendiente ${order.orderId} — ${formatEUR(order.totalCents)}`,
-                mailLayout("Pago en proceso", `${p("El pago todavía no está confirmado (transferencia SEPA, Klarna o revisión del banco). No envíes el pedido hasta que pase a aprobado.")}${clienteHtml(order)}${orderSummaryHtml(order)}`));
+                mail.layout({
+                    audience:  "admin",
+                    preheader: `${formatEUR(order.totalCents)} todavía sin confirmar. No envíes el pedido aún.`,
+                    eyebrow:   "Pago en proceso",
+                    tone:      "warn",
+                    title:     "Pago",
+                    accent:    "pendiente",
+                    intro:     "El banco todavía no confirmó el cobro (transferencia SEPA, Klarna o revisión del banco). <strong>No envíes el pedido</strong> hasta que llegue el aviso de venta confirmada.",
+                    ref:       order.orderId,
+                    body:      `${datosCliente(order)}${resumenPedido(order)}`,
+                    cta:       stripeCta(order.stripePaymentIntentId),
+                }));
             return;
         }
 
@@ -755,7 +822,17 @@ async function handleStripeEvent(event) {
             await order.save();
             if (estabaEnProceso) {
                 await sendMail(ADMIN_EMAIL, `⚪ Pago cancelado ${order.orderId}`,
-                    mailLayout("Pago cancelado", `${p("El pago que estaba en proceso fue cancelado. No hay que enviar este pedido.")}${clienteHtml(order)}`));
+                    mail.layout({
+                        audience:  "admin",
+                        preheader: "El pago en proceso se canceló: no hay que enviar este pedido.",
+                        eyebrow:   "Pago cancelado",
+                        tone:      "info",
+                        title:     "Pago",
+                        accent:    "cancelado",
+                        intro:     "El pago que estaba en proceso fue cancelado. <strong>No hay que enviar este pedido.</strong>",
+                        ref:       order.orderId,
+                        body:      datosCliente(order),
+                    }));
             }
             return;
         }
@@ -770,18 +847,83 @@ async function handleStripeEvent(event) {
             const order = await PaymentsMongo.findOne({ stripePaymentIntentId: piId });
             if (!order) return;
 
-            const antes      = order.refundedCents;
-            const fallidoAntes = order.refunds.filter(r => r.status === "failed").length;
-            await syncRefunds(order);
-            await order.save();
+            // Stripe manda 4 eventos por cada reembolso, casi a la vez. Cada alta y cada
+            // paso a "fallido" se marca con un update condicional: solo el primer evento
+            // lo consigue, así el aviso sale una vez. Los reembolsos hechos desde el
+            // panel (metadata.source = "panel") los registra la propia ruta y no se avisan.
+            const list = await stripe.refunds.list({ payment_intent: piId, limit: 100 });
+            const externos = [];
+            const fallidos = [];
 
-            if (order.refundedCents > antes) {
-                await sendMail(ADMIN_EMAIL, `↩️ Reembolso ${order.orderId} — ${formatEUR(order.refundedCents - antes)}`,
-                    mailLayout("Reembolso registrado", `${p(`Reembolsado en total: <strong style="color:#fff;">${formatEUR(order.refundedCents)}</strong> de ${formatEUR(order.totalCents)}.`)}${clienteHtml(order)}`));
+            for (const r of list.data) {
+                const desdePanel = r.metadata?.source === "panel";
+                if (!desdePanel) {
+                    const alta = await PaymentsMongo.updateOne(
+                        { _id: order._id, "refunds.refundId": { $ne: r.id } },
+                        { $push: { refunds: {
+                            // si ya llega fallido se guarda como pendiente: el paso a "failed" de abajo dispara el aviso una sola vez
+                            refundId: r.id, amountCents: r.amount, status: r.status === "failed" ? "pending" : r.status,
+                            reason: r.reason || null, note: r.metadata?.note || null,
+                            failureReason: r.failure_reason || null,
+                            createdBy: r.metadata?.createdBy || "stripe_dashboard",
+                            createdAt: new Date(r.created * 1000),
+                        } } }
+                    );
+                    if (alta.modifiedCount === 1 && r.status !== "failed") externos.push(r);
+                }
+                if (r.status === "failed") {
+                    const f = await PaymentsMongo.updateOne(
+                        { _id: order._id, refunds: { $elemMatch: { refundId: r.id, status: { $ne: "failed" } } } },
+                        { $set: { "refunds.$.status": "failed", "refunds.$.failureReason": r.failure_reason || null } }
+                    );
+                    if (f.modifiedCount === 1) fallidos.push(r);
+                } else {
+                    await PaymentsMongo.updateOne(
+                        { _id: order._id, "refunds.refundId": r.id },
+                        { $set: { "refunds.$.status": r.status, "refunds.$.amountCents": r.amount } }
+                    );
+                }
             }
-            if (order.refunds.filter(r => r.status === "failed").length > fallidoAntes) {
-                await sendMail(ADMIN_EMAIL, `🔴 Falló un reembolso ${order.orderId}`,
-                    mailLayout("Reembolso fallido", `${alertBox("Stripe no pudo completar un reembolso. Revisalo en el panel de Stripe.")}${clienteHtml(order)}`));
+
+            // estado e importe reembolsado, recalculados sobre el pedido ya actualizado
+            const fresh = await PaymentsMongo.findById(order._id);
+            if (!fresh) return;
+            recomputeRefundState(fresh);
+            await fresh.save();
+
+            const nuevo = externos.reduce((a, r) => a + r.amount, 0);
+            if (nuevo > 0) {
+                await sendMail(ADMIN_EMAIL, `↩️ Reembolso ${fresh.orderId} — ${formatEUR(nuevo)}`,
+                    mail.layout({
+                        audience:  "admin",
+                        preheader: `Se devolvieron ${formatEUR(nuevo)} desde Stripe.`,
+                        eyebrow:   "Reembolso registrado",
+                        tone:      "warn",
+                        title:     "Reembolso",
+                        accent:    formatEUR(nuevo),
+                        intro:     "Se registró un reembolso hecho desde el panel de Stripe (no desde la tienda).",
+                        ref:       fresh.orderId,
+                        body:      `${mail.section("Importes", mail.rows([
+                            ["Total del pedido", formatEUR(fresh.totalCents)],
+                            ["Reembolsado en total", formatEUR(fresh.refundedCents), { color: "#B7650B" }],
+                            ["Queda cobrado", formatEUR(Math.max(fresh.totalCents - fresh.refundedCents, 0))],
+                        ]))}${datosCliente(fresh)}`,
+                        cta:       stripeCta(fresh.stripePaymentIntentId),
+                    }));
+            }
+            if (fallidos.length) {
+                await sendMail(ADMIN_EMAIL, `🔴 Falló un reembolso ${fresh.orderId}`,
+                    mail.layout({
+                        audience:  "admin",
+                        preheader: "Stripe no pudo devolver el dinero al cliente.",
+                        eyebrow:   "Acción necesaria",
+                        title:     "Reembolso",
+                        accent:    "fallido",
+                        intro:     "Stripe no pudo completar un reembolso de este pedido (tarjeta cancelada o cuenta cerrada, por ejemplo). Revísalo en Stripe y coordina la devolución con el cliente.",
+                        ref:       fresh.orderId,
+                        body:      `${mail.section("Reembolso", mail.rows(fallidos.map(r => [formatEUR(r.amount), r.failure_reason || "sin motivo informado"])))}${datosCliente(fresh)}`,
+                        cta:       stripeCta(fresh.stripePaymentIntentId, "Revisar en Stripe"),
+                    }));
             }
             return;
         }
@@ -790,14 +932,31 @@ async function handleStripeEvent(event) {
             const piId = typeof obj.payment_intent === "string" ? obj.payment_intent : obj.payment_intent?.id;
             const order = piId ? await PaymentsMongo.findOne({ stripePaymentIntentId: piId }) : null;
             if (!order || order.dispute?.disputeId === obj.id) return;
-            order.dispute = { disputeId: obj.id, status: obj.status, reason: obj.reason, amountCents: obj.amount, prevStatus: order.status };
+            order.dispute = { disputeId: obj.id, status: obj.status, reason: obj.reason, amountCents: obj.amount, prevStatus: PAID_STATUSES.includes(order.status) && order.status !== "disputed" ? order.status : "approved" };
             order.status      = "disputed";
             order.needsReview = true;
             order.reviewNotes.push(`Contracargo abierto: ${obj.reason}`);
             pushHistory(order, "disputed", `Disputa ${obj.id} (${obj.reason})`);
             await order.save();
+            const limite = obj.evidence_details?.due_by
+                ? new Date(obj.evidence_details.due_by * 1000).toLocaleDateString("es-ES", { dateStyle: "long" })
+                : null;
             await sendMail(ADMIN_EMAIL, `🔴 Contracargo en ${order.orderId} — ${formatEUR(obj.amount)}`,
-                mailLayout("Contracargo abierto", `${alertBox(`Motivo: ${escapeHtml(obj.reason)}. Tenés que responder la disputa desde el panel de Stripe antes de la fecha límite.`)}${clienteHtml(order)}${orderSummaryHtml(order)}`));
+                mail.layout({
+                    audience:  "admin",
+                    preheader: `El cliente disputó ${formatEUR(obj.amount)}${limite ? `. Plazo: ${limite}` : ""}.`,
+                    eyebrow:   "Contracargo abierto",
+                    title:     "Contracargo",
+                    accent:    formatEUR(obj.amount),
+                    intro:     "El cliente disputó el cobro con su banco. Responde desde Stripe antes de la fecha límite, con la prueba de entrega y la factura.",
+                    ref:       order.orderId,
+                    body:      `${mail.section("Disputa", mail.rows([
+                        ["Motivo", obj.reason || "—"],
+                        ["Fecha límite", limite || "Ver en Stripe", { color: "#E84B1A" }],
+                        ["Disputa", obj.id, { mono: true }],
+                    ]))}${datosCliente(order)}${resumenPedido(order)}`,
+                    cta:       stripeCta(order.stripePaymentIntentId, "Responder en Stripe"),
+                }));
             return;
         }
 
@@ -809,8 +968,24 @@ async function handleStripeEvent(event) {
             if (obj.status === "won") order.status = order.dispute.prevStatus || "approved";
             pushHistory(order, order.status, `Disputa cerrada: ${obj.status}`);
             await order.save();
-            await sendMail(ADMIN_EMAIL, `Disputa cerrada en ${order.orderId}: ${obj.status === "won" ? "GANADA" : obj.status.toUpperCase()}`,
-                mailLayout("Disputa cerrada", p(`Resultado: <strong style="color:#fff;">${escapeHtml(obj.status)}</strong>.`)));
+            const ganada = obj.status === "won";
+            await sendMail(ADMIN_EMAIL, `Disputa cerrada en ${order.orderId}: ${ganada ? "GANADA" : String(obj.status).toUpperCase()}`,
+                mail.layout({
+                    audience:  "admin",
+                    preheader: ganada ? "El banco falló a tu favor." : `Resultado de la disputa: ${obj.status}.`,
+                    eyebrow:   "Disputa cerrada",
+                    tone:      ganada ? "ok" : "accent",
+                    title:     "Disputa",
+                    accent:    ganada ? "ganada" : obj.status === "lost" ? "perdida" : String(obj.status),
+                    intro:     ganada
+                        ? "El banco falló a tu favor: el cobro se mantiene y el pedido vuelve a su estado anterior."
+                        : obj.status === "lost"
+                            ? "El banco falló a favor del cliente: el importe se devolvió y Stripe descuenta la comisión de disputa."
+                            : `Estado final informado por Stripe: ${escapeHtml(obj.status)}.`,
+                    ref:       order.orderId,
+                    body:      datosCliente(order),
+                    cta:       stripeCta(order.stripePaymentIntentId),
+                }));
             return;
         }
 
@@ -1244,7 +1419,7 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, requireSignPi
             payment_intent: order.stripePaymentIntentId,
             amount:         amountCents,
             ...(validReasons.includes(reason) ? { reason } : {}),
-            metadata: { orderId: String(order._id), createdBy: req.user?.email || "admin", note: cleanStr(note, 400) },
+            metadata: { orderId: String(order._id), source: "panel", createdBy: req.user?.email || "admin", note: cleanStr(note, 400) },
         }, { idempotencyKey: `refund_${order._id}_${order.refunds.length}_${amountCents}` });
 
         let entry = order.refunds.find(r => r.refundId === refund.id);
@@ -1277,8 +1452,22 @@ stripeRouter.post("/api/admin/orders/:id/refund", adminMiddleware, requireSignPi
         pushHistory(order, order.status, `Reembolso ${formatEUR(amountCents)} por ${req.user?.email || "admin"}${repuestos.length ? ` · stock repuesto: ${repuestos.join(", ")}` : ""}`);
         await order.save();
 
-        await sendMail(order.email, `Reembolso de tu pedido ${order.orderId}`,
-            mailLayout("Reembolso en camino", `${p(`Hemos solicitado un reembolso de <strong style="color:#fff;">${formatEUR(amountCents)}</strong> a tu método de pago. Según tu banco puede tardar entre 5 y 10 días hábiles en verse reflejado.`)}${p(`Pedido ${escapeHtml(order.orderId)}`)}`));
+        const nombreCliente = primerNombre(order);
+        await sendMail(order.email, `Reembolso de tu pedido ${order.orderId} — ${STORE_NAME}`,
+            mail.layout({
+                preheader: `Devolvemos ${formatEUR(amountCents)} a tu método de pago.`,
+                eyebrow:   "Reembolso solicitado",
+                tone:      "ok",
+                title:     "Tu reembolso",
+                accent:    "está en camino",
+                intro:     `${nombreCliente ? `Hola, ${escapeHtml(nombreCliente)}. ` : ""}Hemos solicitado la devolución de <strong style="color:#1A1614;">${formatEUR(amountCents)}</strong> a tu método de pago. Según tu banco, puede tardar entre 5 y 10 días hábiles en verse reflejado.`,
+                ref:       order.orderId,
+                body:      `${mail.section("Reembolso", mail.rows([
+                    ["Pedido", order.orderId, { mono: true }],
+                    ["Importe devuelto", formatEUR(amountCents), { color: "#2F7A4B" }],
+                    ["Total reembolsado", `${formatEUR(order.refundedCents)} de ${formatEUR(order.totalCents)}`],
+                ]))}${mail.para("Si pasados 10 días hábiles no lo ves en tu cuenta, responde a este correo y lo revisamos.")}`,
+            }));
 
         res.status(200).json({ message: `Reembolso de ${formatEUR(amountCents)} solicitado 🟢`, refund: { id: refund.id, status: refund.status }, order: sinSecretos(order) });
 

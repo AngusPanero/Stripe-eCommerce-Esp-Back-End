@@ -5,7 +5,7 @@ const Cart    = require("../models/CartSchema");
 const Product = require("../models/productModel");
 const verifyToken     = require('../middleware/authMiddleware');
 const adminMiddleware = require('../middleware/adminMiddleware');
-const nodemailer = require("nodemailer");
+const { mail } = require("./contactRouter");   // transporte y diseño compartidos de los mails
 const requireSignPin = require("../middleware/requireSignPin");
 
 // Misma lógica de precios y cupones que el cobro real
@@ -44,8 +44,6 @@ const normEmail = (v) => (typeof v === "string" ? v.trim().toLowerCase().slice(0
 const EMAIL_RE  = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const CODE_RE   = /^[A-Za-z0-9_-]{3,30}$/;
 
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const eur = (n) => Number(n || 0).toLocaleString("es-ES", { style: "currency", currency: "EUR" });
 
 // ── Fechas en la zona del negocio ──
 const tzFmt = new Intl.DateTimeFormat("en-US", {
@@ -498,6 +496,10 @@ cartRouter.post("/api/cart/send-recovery", adminMiddleware, async (req, res) => 
         couponCode = rawCoupon.trim().toUpperCase();
     }
 
+    if (!mail.configurado) {
+        return res.status(503).json({ message: "El envío de mails no está configurado en el servidor (EMAIL_FROM / PASS_EMAIL) 🔴" });
+    }
+
     try {
         const cart = await Cart.findOne({ userEmail: email }).lean();
         if (!cart || !cart.items?.length) {
@@ -515,131 +517,47 @@ cartRouter.post("/api/cart/send-recovery", adminMiddleware, async (req, res) => 
             return res.status(409).json({ message: "Ningún producto de ese carrito sigue disponible 🔴" });
         }
 
-        const itemRows = items.map(item => `
-        <tr>
-          <td style="padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.06);vertical-align:middle;">
-            <table role="presentation" cellpadding="0" cellspacing="0">
-              <tr>
-                <td style="padding-right:14px;vertical-align:middle;">
-                  ${/^https:\/\//i.test(item.imagen)
-                    ? `<img src="${esc(item.imagen)}" alt="${esc(item.nombre)}" width="52" height="52" style="display:block;object-fit:cover;border:1px solid rgba(232,75,26,0.25);"/>`
-                    : `<div style="width:52px;height:52px;background:rgba(232,75,26,0.08);border:1px solid rgba(232,75,26,0.2);"></div>`
-                  }
-                </td>
-                <td style="vertical-align:middle;">
-                  <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:14px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#F0EBE5;margin:0 0 3px;">${esc(item.nombre)}</p>
-                  <p style="font-family:'Barlow',Arial,sans-serif;font-size:12px;font-weight:300;color:rgba(240,235,229,0.45);margin:0;">
-                    Cant: ${item.cantidad}
-                    ${item.varianteLabel ? `· ${esc(item.varianteLabel)}` : ""}
-                  </p>
-                </td>
-              </tr>
-            </table>
-          </td>
-          <td style="padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;vertical-align:middle;">
-            <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:16px;font-weight:800;color:#F0EBE5;margin:0;">
-              ${eur(item.precio * item.cantidad)}
-            </p>
-          </td>
-        </tr>
-    `).join("");
+        const totalBrutoCents = items.reduce((acc, i) => acc + Math.round(i.precio * 100) * i.cantidad, 0);
+        const cupon = couponCode ? await Coupon.findOne({ code: couponCode }).select("discount expiryDate").lean() : null;
+        const vence = cupon?.expiryDate ? new Date(cupon.expiryDate).toLocaleDateString("es-ES", { dateStyle: "long" }) : null;
+        const n = items.reduce((a, i) => a + i.cantidad, 0);
 
-        const totalBruto = items.reduce((acc, i) => acc + i.precio * i.cantidad, 0);
-
-        const couponBlock = couponCode ? `
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-          style="margin-top:24px;background:rgba(232,75,26,0.07);border:1px solid rgba(232,75,26,0.3);">
-          <tr>
-            <td style="padding:18px 20px;">
-              <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.28em;text-transform:uppercase;color:#E84B1A;margin:0 0 6px;">CUPÓN EXCLUSIVO PARA TI</p>
-              <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:28px;font-weight:800;letter-spacing:0.1em;color:#ffffff;margin:0;">${esc(couponCode)}</p>
-              <p style="font-family:'Barlow',Arial,sans-serif;font-size:12px;font-weight:300;color:rgba(240,235,229,0.5);margin:6px 0 0;">Introdúcelo al finalizar tu compra para obtener tu descuento.</p>
-            </td>
-            <td style="padding:18px 20px;text-align:right;vertical-align:middle;">
-              <div style="width:48px;height:48px;background:rgba(232,75,26,0.15);border:1px solid rgba(232,75,26,0.4);display:inline-block;text-align:center;line-height:48px;font-size:22px;">🎁</div>
-            </td>
-          </tr>
-        </table>
-    ` : "";
-
-        const html = `
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-          <meta charset="UTF-8"/>
-          <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-          <title>Completa tu compra — Dekin Hogar</title>
-        </head>
-        <body style="margin:0;padding:0;background-color:#F2EDE8;">
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#F2EDE8;padding:40px 16px;">
-            <tr><td align="center">
-              <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background-color:#1A1614;">
-                <tr>
-                  <td style="background-color:#E84B1A;padding:32px 40px 28px;">
-                    <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:36px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#fff;line-height:1;margin:0;">DEKIN</p>
-                    <p style="font-family:'Barlow',Arial,sans-serif;font-size:10px;font-weight:300;letter-spacing:.42em;text-transform:uppercase;color:rgba(255,255,255,.75);margin:3px 0 0 2px;">HOGAR</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="background-color:#1A1614;padding:48px 40px 40px;">
-                    <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:32px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#F0EBE5;line-height:1.1;margin:0 0 16px;">
-                      Dejaste productos<br/><span style="color:#E84B1A;">en tu carrito</span>
-                    </p>
-                    <p style="font-family:'Barlow',Arial,sans-serif;font-size:16px;font-weight:300;color:rgba(240,235,229,.7);line-height:1.65;margin:0 0 32px;">
-                      Tienes artículos esperándote. El stock es limitado, ¡no pierdas lo que ya elegiste!
-                    </p>
-                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                      ${itemRows}
-                      <tr>
-                        <td style="padding-top:16px;">
-                          <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:.22em;text-transform:uppercase;color:rgba(240,235,229,.35);margin:0;">TOTAL ESTIMADO</p>
-                        </td>
-                        <td style="padding-top:16px;text-align:right;">
-                          <p style="font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:22px;font-weight:800;color:#F0EBE5;margin:0;">${eur(totalBruto)}</p>
-                        </td>
-                      </tr>
-                    </table>
-                    ${couponBlock}
-                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:32px;">
-                      <tr>
-                        <td style="background-color:#E84B1A;">
-                          <a href="${esc(process.env.FRONTEND_URL || "#")}" style="display:inline-block;padding:14px 32px;font-family:'Barlow Condensed','Arial Narrow',Arial,sans-serif;font-size:13px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#ffffff;text-decoration:none;">
-                            COMPLETAR MI COMPRA →
-                          </a>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="background-color:#E84B1A;padding:14px 40px;">
-                    <p style="font-family:'Barlow',Arial,sans-serif;font-size:10px;font-weight:300;letter-spacing:.08em;color:rgba(255,255,255,.65);margin:0;">
-                      © ${new Date().getFullYear()} DEKIN HOGAR · Desarrollado por <a href="https://www.deepdev.com.ar" target="_blank" style="color:rgba(255,255,255,.85);text-decoration:none;font-weight:600;">DeepDev Studio</a>
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td></tr>
-          </table>
-        </body>
-        </html>
-    `;
-
-        const transporter = nodemailer.createTransport({
-            service: "gmail",
-            auth: { user: process.env.EMAIL_FROM, pass: process.env.PASS_EMAIL },
+        const html = mail.layout({
+            preheader: couponCode
+                ? `Te guardamos tu carrito${cupon?.discount ? ` y un ${cupon.discount}% de descuento` : ""} con el código ${couponCode}.`
+                : `Tus ${n} artículo${n === 1 ? "" : "s"} siguen esperándote. El stock es limitado.`,
+            eyebrow: couponCode ? "Un regalo para ti" : "Tu carrito te espera",
+            title:   "Lo dejaste",
+            accent:  "a medio camino",
+            intro:   couponCode
+                ? `Guardamos tu selección y te dejamos un descuento${cupon?.discount ? ` del <strong style="color:#1A1614;">${cupon.discount}%</strong>` : ""} para que la termines cuando quieras.`
+                : "Guardamos tu selección. El stock es limitado, así que no la dejes pasar si te sigue gustando.",
+            body: `
+              ${couponCode ? mail.code(couponCode, `Introdúcelo al finalizar la compra${vence ? ` · Válido hasta el ${vence}` : ""}`) : ""}
+              ${mail.section("Tu carrito", mail.itemsTable(items.map(i => ({
+                  nombre:     i.nombre,
+                  detalle:    i.varianteLabel || "",
+                  cantidad:   i.cantidad,
+                  totalCents: Math.round(i.precio * 100) * i.cantidad,
+                  imagen:     i.imagen,
+              }))) + mail.totals([["Total estimado", totalBrutoCents, { strong: true }]]))}
+              ${mail.para("Los precios y el stock se confirman al pagar.")}`,
+            cta: { label: "Completar mi compra", href: mail.siteUrl ? `${mail.siteUrl}/cart` : "#", variant: "accent" },
         });
 
-        await transporter.sendMail({
-            from:    process.env.EMAIL_FROM,
+        await mail.enviar({
             to:      email,
-            subject: couponCode ? `🛒 Completa tu compra — tienes un cupón exclusivo` : `🛒 Dejaste productos en tu carrito — Dekin Hogar`,
+            subject: couponCode ? `Tu carrito te espera, con un descuento — ${mail.storeName}` : `Tu carrito te espera — ${mail.storeName}`,
             html,
         });
         res.json({ ok: true, message: "Mail enviado" });
     } catch (err) {
         console.error("ERROR SEND RECOVERY:", err);
-        res.status(500).json({ message: "Error al enviar mail 🔴" });   // sin detalles internos
+        // la ruta es solo de admin: se le dice qué revisar, sin el detalle técnico
+        if (err?.code === "EAUTH") {
+            return res.status(502).json({ message: "Gmail rechazó el usuario o la contraseña de aplicación (EMAIL_FROM / PASS_EMAIL) 🔴" });
+        }
+        res.status(500).json({ message: "Error al enviar mail 🔴" });
     }
 });
 
